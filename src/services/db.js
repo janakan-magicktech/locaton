@@ -176,6 +176,9 @@ export function getRecordedRoute(savedLocationId) {
   )
 }
 
+// True only when a *usable* trail exists. A single breadcrumb is not a path
+// (it draws no line and can't be fit to bounds), so we require at least two
+// points before offering "Follow Previous Path".
 export function hasRecordedRoute(savedLocationId) {
   const r = rows(
     db.exec(
@@ -183,5 +186,5 @@ export function hasRecordedRoute(savedLocationId) {
       [savedLocationId],
     ),
   )
-  return (r[0]?.c || 0) > 0
+  return (r[0]?.c || 0) >= 2
 }

@@ -239,9 +239,12 @@ export default function App() {
   const handleFollowPrevious = () => {
     const loc = selectedForRoute
     const recorded = getRecordedRoute(loc.id) // [{latitude, longitude,...}]
-    if (recorded.length === 0) {
+    if (recorded.length < 2) {
       setRouteError(
-        'No recorded path yet — navigate here once with “Use Shortest Path” to record a trail.',
+        'No usable trail yet — a previous path is built from the GPS breadcrumbs ' +
+          'recorded while you actually travel here. Navigate here once with ' +
+          '“Use Shortest Path” and move along the route to record a trail, then ' +
+          'this option will replay it.',
       )
       return
     }
