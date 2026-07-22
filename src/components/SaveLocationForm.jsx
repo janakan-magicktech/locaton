@@ -22,6 +22,7 @@ export default function SaveLocationForm({ pin, onSave, onCancel, isCurrent }) {
       <h3 style={{ marginTop: 0 }}>
         {isCurrent ? 'Pin current location' : 'Save selected point'}
       </h3>
+      {pin.label && <p className="resolved-address">{pin.label}</p>}
       <p className="coords">
         {pin.latitude.toFixed(6)}, {pin.longitude.toFixed(6)}
       </p>

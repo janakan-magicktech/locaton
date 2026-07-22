@@ -4,6 +4,7 @@ import OfflineGate from './components/OfflineGate.jsx'
 import PermissionGate from './components/PermissionGate.jsx'
 import SaveLocationForm from './components/SaveLocationForm.jsx'
 import SavedLocationsList from './components/SavedLocationsList.jsx'
+import DestinationSearch from './components/DestinationSearch.jsx'
 import RouteChoiceDialog from './components/RouteChoiceDialog.jsx'
 import TrackingPanel from './components/TrackingPanel.jsx'
 import { useOnlineStatus } from './hooks/useOnlineStatus.js'
@@ -42,7 +43,8 @@ export default function App() {
 
   // UI/data state.
   const [locations, setLocations] = useState([])
-  const [pendingPin, setPendingPin] = useState(null) // {latitude, longitude, isCurrent}
+  const [pendingPin, setPendingPin] = useState(null) // {latitude, longitude, isCurrent, label?}
+  const [flyTo, setFlyTo] = useState(null) // [lng, lat] the map should recenter on
   const [selectedForRoute, setSelectedForRoute] = useState(null) // saved location awaiting mode choice
   const [routeError, setRouteError] = useState(null)
   const [loadingRoute, setLoadingRoute] = useState(false)
@@ -95,6 +97,19 @@ export default function App() {
     },
     [tracking],
   )
+
+  // A destination the user typed and picked from search results. Drop it as a
+  // pending pin (the map auto-marks it via the `destination` prop) and fly the
+  // map to it so the auto-placed marker is visible.
+  const handleManualDestination = useCallback((result) => {
+    setPendingPin({
+      latitude: result.latitude,
+      longitude: result.longitude,
+      isCurrent: false,
+      label: result.label,
+    })
+    setFlyTo([result.longitude, result.latitude])
+  }, [])
 
   const handleSave = async ({ name, notes }) => {
     await saveLocation({
@@ -287,6 +302,7 @@ export default function App() {
         destination={tracking?.location || selectedForRoute || pendingPin}
         routeCoordinates={tracking?.routeCoordinates}
         routeColor={tracking?.mode === 'previous' ? '#a371f7' : '#2f81f7'}
+        flyTo={flyTo}
         onMapClick={handleMapClick}
       />
 
@@ -339,6 +355,8 @@ export default function App() {
                 📍 Pin current location
               </button>
               <p className="hint">…or click anywhere on the map to pin a point.</p>
+
+              <DestinationSearch onPick={handleManualDestination} />
 
               <label className="threshold-control">
                 Arrival threshold

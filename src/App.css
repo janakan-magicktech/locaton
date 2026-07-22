@@ -47,6 +47,48 @@
 .threshold-options { display: flex; gap: 6px; }
 .threshold-options button { flex: 1; padding: 6px 8px; }
 
+/* Manual destination search ------------------------------------------------*/
+.destination-search {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.destination-search > label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+}
+.destination-search .row-buttons { justify-content: stretch; }
+.destination-search input { flex: 1 1 auto; min-width: 0; }
+.destination-search .primary { flex: 0 0 auto; width: auto; }
+
+.search-results {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.search-results button {
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  cursor: pointer;
+}
+.search-results button:hover { border-color: var(--accent, #2f81f7); }
+
+.resolved-address { font-size: 13px; color: var(--muted); margin: 0; }
+
 /* Cards --------------------------------------------------------------------*/
 .panel-card {
   background: var(--panel-2);

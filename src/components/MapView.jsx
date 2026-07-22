@@ -25,6 +25,7 @@ const ROUTE_LAYER = 'route-line-layer'
 //   destination       { latitude, longitude } | null  -> destination marker
 //   routeCoordinates  [[lng,lat],...] | null           -> route/breadcrumb line
 //   routeColor        line color (differs for shortest vs recorded path)
+//   flyTo             [lng, lat] | null -> recenter the map when this changes
 //   onMapClick        (lngLat) => void  fired when the user clicks the map
 export default function MapView({
   center = [0, 0],
@@ -32,6 +33,7 @@ export default function MapView({
   destination,
   routeCoordinates,
   routeColor = '#2f81f7',
+  flyTo,
   onMapClick,
 }) {
   const containerRef = useRef(null)
@@ -120,6 +122,13 @@ export default function MapView({
       destMarkerRef.current.setLngLat(lngLat)
     }
   }, [destination])
+
+  // Recenter the map when asked to (e.g. after a manual destination search).
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || !flyTo) return
+    map.flyTo({ center: flyTo, zoom: 15, duration: 800 })
+  }, [flyTo])
 
   // Route line updates.
   useEffect(() => {

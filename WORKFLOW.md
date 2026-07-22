@@ -4,7 +4,7 @@
 
 **Find My Location** is an online-only, browser-based React application that lets a user pin geographic points, save them locally, and navigate back to them with live GPS tracking. It has no offline mode — map tiles, routing, and connectivity are all assumed to require the internet.
 
-**Stack:** React + Vite · MapLibre GL JS (maps) · sql.js/SQLite-in-WebAssembly persisted to IndexedDB (storage) · OSRM public demo API (routing) · browser Geolocation + Permissions APIs (location).
+**Stack:** React + Vite · MapLibre GL JS (maps) · sql.js/SQLite-in-WebAssembly persisted to IndexedDB (storage) · OSRM public demo API (routing) · Nominatim/OpenStreetMap API (address search / geocoding) · browser Geolocation + Permissions APIs (location).
 
 ---
 
@@ -15,9 +15,9 @@
 | **Entry** | `main.jsx`, `index.html` | Mount React, load global CSS + MapLibre CSS |
 | **Orchestration** | `App.jsx` | Holds all app state, decides which screen renders, drives the tracking loop |
 | **Hooks** | `useOnlineStatus`, `useDatabase`, `useGeolocation` | Reusable stateful logic bound to browser APIs |
-| **Services** | `db.js`, `routing.js`, `geolocation.js` | Side-effect boundaries (SQLite, OSRM fetch, GPS) |
+| **Services** | `db.js`, `routing.js`, `geocoding.js`, `geolocation.js` | Side-effect boundaries (SQLite, OSRM fetch, Nominatim fetch, GPS) |
 | **Utils** | `geo.js` | Pure math — Haversine distance, bearing, formatting |
-| **Components** | `MapView`, `OfflineGate`, `PermissionGate`, `SaveLocationForm`, `SavedLocationsList`, `RouteChoiceDialog`, `TrackingPanel` | Presentational UI |
+| **Components** | `MapView`, `OfflineGate`, `PermissionGate`, `SaveLocationForm`, `SavedLocationsList`, `DestinationSearch`, `RouteChoiceDialog`, `TrackingPanel` | Presentational UI |
 
 The design principle is **one-directional flow**: browser APIs → hooks → `App.jsx` state → presentational components. Components never touch the database or GPS directly; they receive data and callbacks as props.
 
@@ -73,12 +73,41 @@ write → db.run(INSERT/DELETE) → db.export() → idbPut('db-file', bytes)
 
 ## 5. Pin & save workflow
 
-Two entry points produce a `pendingPin` `{latitude, longitude, isCurrent}`:
+Three entry points produce a `pendingPin` `{latitude, longitude, isCurrent, label?}`:
 
-- **"Pin current location"** → `getCurrentPosition()` returns the user's fix.
+- **"Pin current location"** → `getCurrentPosition()` returns the user's fix (`isCurrent: true`).
 - **Clicking the map** → MapLibre's click event supplies `lngLat`.
+- **Typing a destination** (`DestinationSearch` + `geocoding.js`) → the user enters an address/place name; the app geocodes it and drops a pin on the chosen match, carrying its `label`.
 
-The pin renders a marker and opens `SaveLocationForm` (name + notes, both optional). On submit → `saveLocation()` inserts a row, persists to IndexedDB, and the saved list refreshes.
+Whichever entry point fires, the map **auto-marks** the point: `App.jsx` passes `destination = tracking?.location || selectedForRoute || pendingPin` to `MapView`, whose destination-marker effect places/moves a single red pin whenever that prop changes. No entry point places a marker itself — they only set state.
+
+The pin opens `SaveLocationForm` (name + notes, both optional; the resolved `label` is shown for confirmation when present). On submit → `saveLocation()` inserts a row, persists to IndexedDB, and the saved list refreshes.
+
+### 5a. Manual destination search (geocoding)
+
+This is the "type it instead of clicking it" path.
+
+```
+user types text → Search
+   │
+   ▼
+geocodeDestination(query)                       // services/geocoding.js
+   GET https://nominatim.openstreetmap.org/search
+       ?q={query}&format=jsonv2&addressdetails=1&limit=5
+   │  → [{ label: display_name, latitude, longitude }, ...]
+   ▼
+DestinationSearch lists up to 5 candidate matches
+   │  user picks one
+   ▼
+onPick(result) → App.handleManualDestination(result)
+   ├─ setPendingPin({ ...result, isCurrent: false })   // map auto-marks it (see above)
+   └─ setFlyTo([lng, lat])                              // map recenters onto the marker
+```
+
+- **Geocoding** is *forward* geocoding (text → coordinates), the mirror of the GPS/routing flow. Nominatim returns `lat`/`lon` as **strings**, which the service parses to numbers and filters for finite values.
+- **Auto-centering:** `App.jsx` holds a `flyTo` state (`[lng, lat] | null`). Setting it triggers a `MapView` effect that calls `map.flyTo({ center, zoom: 15 })`, so the auto-placed marker is always brought into view. A fresh array is created per pick, so re-searching the same place still re-fires the effect.
+- **Then what:** the picked point is now an ordinary `pendingPin` — the user can save it (§5) or, once saved and selected, navigate to it (§6). Nothing about the downstream flow is special-cased for search-originated pins.
+- **Rate limits:** search fires only on explicit submit, staying within Nominatim's ≤1 req/sec policy. Browsers cannot set a custom `User-Agent`; heavier/production use should move to a keyed geocoding provider — isolated to `geocoding.js`, a single-file swap.
 
 ---
 
@@ -129,6 +158,7 @@ Every fix logged during tracking becomes future "Follow Previous Path" data — 
 - **Whole-DB export on each write** — simple and correct for this data scale; would need incremental persistence only at much larger volumes.
 - **Bundled wasm over CDN** — guarantees the wasm version matches the installed `sql.js` (1.14.1). *This was the fix for the earlier white-screen bug:* excluding sql.js from Vite pre-bundling left it as un-transformed UMD, crashing module load before CSS applied.
 - **Routing isolated in one service** — swapping OSRM for GraphHopper/OpenRouteService is a single-file change.
+- **Geocoding isolated in one service** — same principle for `geocoding.js`; swapping Nominatim for a keyed provider (Mapbox, Google, etc.) touches only that file. Manual entry reuses the existing `pendingPin` marker path rather than adding a parallel one.
 - **Presentational components are stateless** — all side effects live in hooks/services, making the UI easy to test and reason about.
 
 ---
@@ -138,3 +168,4 @@ Every fix logged during tracking becomes future "Follow Previous Path" data — 
 - **HTTPS required** in deployment — the Geolocation API only runs in a secure context (`localhost` is exempt for dev).
 - **No offline capability** by design — no tile cache, no offline routing, no GPS-only fallback.
 - **OSRM demo API** is rate-limited and not for production traffic.
+- **Nominatim public API** asks for ≤1 request/sec and an identifying `User-Agent` (which browsers cannot set) — fine for on-submit search, but a keyed geocoding provider is required for production.
