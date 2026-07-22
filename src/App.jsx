@@ -10,6 +10,7 @@ import { useOnlineStatus } from './hooks/useOnlineStatus.js'
 import { useDatabase } from './hooks/useDatabase.js'
 import { useGeolocation } from './hooks/useGeolocation.js'
 import {
+  clearRecordedRoute,
   deleteSavedLocation,
   getRecordedRoute,
   getSavedLocations,
@@ -59,6 +60,10 @@ export default function App() {
   // tracking shape:
   // { location, mode, routeCoordinates, remaining, bearing, reached }
   const prevPointRef = useRef(null) // for bearing calc between updates
+  // False until the first new breadcrumb of a recording trip has replaced the
+  // old trail. Deferring the wipe to the first fix means a trip that never
+  // gets a GPS fix leaves any existing saved path intact.
+  const trailClearedRef = useRef(false)
 
   const refreshLocations = useCallback(() => {
     if (dbReady) setLocations(getSavedLocations())
@@ -112,7 +117,7 @@ export default function App() {
   // Compute derived tracking values for a new position + record breadcrumb.
   const onPositionDuringTracking = useCallback(
     (point, session) => {
-      const { location, savedLocationId } = session
+      const { location, savedLocationId, mode } = session
 
       // Remaining distance via Haversine.
       const remaining = haversineMeters(
@@ -135,12 +140,22 @@ export default function App() {
       }
       prevPointRef.current = point
 
-      // Log the breadcrumb for future "Follow Previous Path".
-      recordRoutePoint({
-        savedLocationId,
-        latitude: point.latitude,
-        longitude: point.longitude,
-      })
+      // Log the breadcrumb for future "Follow Previous Path" — only while on a
+      // real outbound trip. Replaying a saved path ('previous') must NOT
+      // re-record, or the stored trail gets polluted with every replay.
+      if (mode !== 'previous') {
+        // First fix of this trip replaces the old trail so the saved path is
+        // exactly the most recent journey, not a mix of every trip.
+        if (!trailClearedRef.current) {
+          clearRecordedRoute(savedLocationId)
+          trailClearedRef.current = true
+        }
+        recordRoutePoint({
+          savedLocationId,
+          latitude: point.latitude,
+          longitude: point.longitude,
+        })
+      }
 
       const reached = remaining <= thresholdRef.current
 
@@ -167,6 +182,7 @@ export default function App() {
   const beginTracking = useCallback(
     (location, mode, routeCoordinates) => {
       prevPointRef.current = null
+      trailClearedRef.current = false
       const session = { location, savedLocationId: location.id, mode }
       setTracking({
         location,
@@ -192,7 +208,14 @@ export default function App() {
   const handleFollowPrevious = () => {
     const loc = selectedForRoute
     const recorded = getRecordedRoute(loc.id) // [{latitude, longitude,...}]
+    if (recorded.length === 0) {
+      setRouteError(
+        'No recorded path yet — navigate here once with “Use Shortest Path” to record a trail.',
+      )
+      return
+    }
     const coords = recorded.map((p) => [p.longitude, p.latitude])
+    setRouteError(null)
     setSelectedForRoute(null)
     beginTracking(loc, 'previous', coords)
   }

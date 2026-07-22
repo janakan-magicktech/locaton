@@ -17,7 +17,6 @@ export default function RouteChoiceDialog({
       <div className="choice-buttons">
         <button
           onClick={onFollowPrevious}
-          disabled={!hasPrevious}
           title={
             hasPrevious
               ? 'Replay the breadcrumb trail recorded on a previous trip'

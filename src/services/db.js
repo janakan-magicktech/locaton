@@ -155,6 +155,14 @@ export async function recordRoutePoint({ savedLocationId, latitude, longitude })
   await persist()
 }
 
+// Remove all recorded breadcrumbs for a destination (start a fresh trail).
+export async function clearRecordedRoute(savedLocationId) {
+  db.run('DELETE FROM recorded_routes WHERE saved_location_id = ?', [
+    savedLocationId,
+  ])
+  await persist()
+}
+
 // Return the previously recorded breadcrumb path for a destination, ordered.
 export function getRecordedRoute(savedLocationId) {
   return rows(
