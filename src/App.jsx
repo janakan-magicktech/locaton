@@ -75,6 +75,22 @@ export default function App() {
     refreshLocations()
   }, [refreshLocations])
 
+  // Live "you" marker: as soon as permission is granted, watch position
+  // continuously so the blue dot follows real movement — not just during a
+  // navigation session. A tracking session installs its own watch (which
+  // replaces this one and still updates `position`); stopTracking() resumes
+  // this background watch afterwards.
+  //
+  // `tracking` is intentionally NOT a dependency: tracking manages the watch
+  // itself, and re-running this effect on tracking changes would tear down the
+  // tracking watch mid-session.
+  useEffect(() => {
+    if (permission !== 'granted') return
+    startWatch()
+    return () => stopWatch()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [permission, startWatch, stopWatch])
+
   // --- pin / save -----------------------------------------------------------
 
   const pinCurrentLocation = async () => {
@@ -252,10 +268,13 @@ export default function App() {
   }
 
   const stopTracking = () => {
-    stopWatch()
     prevPointRef.current = null
     setTracking(null)
     refreshLocations()
+    // Resume the live background watch so the "you" marker keeps following the
+    // user after navigation ends (instead of freezing at the last fix).
+    if (permission === 'granted') startWatch()
+    else stopWatch()
   }
 
   // --- render gates ----------------------------------------------------------
