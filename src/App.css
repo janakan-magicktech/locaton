@@ -34,6 +34,18 @@
 .action-bar { display: flex; flex-direction: column; gap: 6px; }
 .action-bar .primary { width: 100%; }
 .hint { color: var(--muted); font-size: 13px; margin: 0; }
+.hint.warn { color: #e3b341; }
+
+.threshold-control {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  margin-top: 4px;
+}
+.threshold-options { display: flex; gap: 6px; }
+.threshold-options button { flex: 1; padding: 6px 8px; }
 
 /* Cards --------------------------------------------------------------------*/
 .panel-card {

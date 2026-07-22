@@ -22,7 +22,10 @@ import { bearingDegrees, haversineMeters } from './utils/geo.js'
 import './App.css'
 
 // Distance (meters) below which we consider the destination "reached".
-const REACHED_THRESHOLD_M = 20
+// User-selectable; detection is pure Haversine distance, so it is independent
+// of walking vs driving and works at any of these thresholds.
+const THRESHOLD_OPTIONS = [10, 20, 50]
+const DEFAULT_THRESHOLD_M = 10
 
 export default function App() {
   const { online, recheck } = useOnlineStatus()
@@ -42,6 +45,14 @@ export default function App() {
   const [selectedForRoute, setSelectedForRoute] = useState(null) // saved location awaiting mode choice
   const [routeError, setRouteError] = useState(null)
   const [loadingRoute, setLoadingRoute] = useState(false)
+
+  // Reached threshold (meters). A ref mirrors it so the long-lived
+  // watchPosition callback always reads the current value without re-binding.
+  const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD_M)
+  const thresholdRef = useRef(threshold)
+  useEffect(() => {
+    thresholdRef.current = threshold
+  }, [threshold])
 
   // Active tracking session.
   const [tracking, setTracking] = useState(null)
@@ -131,7 +142,7 @@ export default function App() {
         longitude: point.longitude,
       })
 
-      const reached = remaining <= REACHED_THRESHOLD_M
+      const reached = remaining <= thresholdRef.current
 
       setTracking((t) =>
         t
@@ -305,6 +316,27 @@ export default function App() {
                 📍 Pin current location
               </button>
               <p className="hint">…or click anywhere on the map to pin a point.</p>
+
+              <label className="threshold-control">
+                Arrival threshold
+                <div className="threshold-options">
+                  {THRESHOLD_OPTIONS.map((m) => (
+                    <button
+                      key={m}
+                      className={threshold === m ? 'primary' : ''}
+                      onClick={() => setThreshold(m)}
+                    >
+                      {m} m
+                    </button>
+                  ))}
+                </div>
+              </label>
+              {threshold <= 10 && (
+                <p className="hint warn">
+                  ⚠ 10 m needs good GPS — if accuracy is worse than 10 m,
+                  arrival may not trigger reliably.
+                </p>
+              )}
             </div>
             <h3>Saved locations</h3>
             <SavedLocationsList
