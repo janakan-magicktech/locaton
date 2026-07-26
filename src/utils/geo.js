@@ -38,6 +38,74 @@ export function compassLabel(bearing) {
   return dirs[Math.round(bearing / 22.5) % 16]
 }
 
+// Project a point onto the line segment A->B and return the closest point on
+// it. Uses a local equirectangular approximation (longitude scaled by cos(lat))
+// so the math is plain 2D geometry — accurate at the scale of a single route
+// segment, which is all we need.
+// Returns { t, lng, lat }, where t in [0,1] is how far along A->B the foot of
+// the perpendicular falls (clamped to the segment's ends).
+function projectOntoSegment(lng, lat, aLng, aLat, bLng, bLat) {
+  const kx = Math.cos(toRad(lat)) // meters-per-degree ratio, lng vs lat
+  // Segment endpoints relative to the query point.
+  const ax = (aLng - lng) * kx
+  const ay = aLat - lat
+  const dx = (bLng - aLng) * kx
+  const dy = bLat - aLat
+  const lenSq = dx * dx + dy * dy
+  // Minimize |A + t*D|^2  ->  t = -(A·D) / |D|^2
+  let t = lenSq === 0 ? 0 : -(ax * dx + ay * dy) / lenSq
+  t = Math.max(0, Math.min(1, t))
+  return { t, lng: aLng + (bLng - aLng) * t, lat: aLat + (bLat - aLat) * t }
+}
+
+// Snap a live GPS position onto a route polyline.
+//
+// `coords` is [[lng,lat],...]. `fromIndex` restricts the search to segments at
+// or after that index, so progress only ever moves forward — without it, a
+// route that doubles back near its own start can snap backwards and "un-travel"
+// part of the line.
+//
+// Returns { index, point: [lng,lat], distanceMeters }, where `index` is the
+// segment the position fell on. Null for a degenerate route.
+export function snapToRoute(coords, lat, lng, fromIndex = 0) {
+  if (!coords || coords.length < 2) return null
+  const start = Math.max(0, Math.min(fromIndex, coords.length - 2))
+  let best = null
+  for (let i = start; i < coords.length - 1; i++) {
+    const [aLng, aLat] = coords[i]
+    const [bLng, bLat] = coords[i + 1]
+    const p = projectOntoSegment(lng, lat, aLng, aLat, bLng, bLat)
+    const d = haversineMeters(lat, lng, p.lat, p.lng)
+    if (!best || d < best.distanceMeters) {
+      best = { index: i, point: [p.lng, p.lat], distanceMeters: d }
+    }
+  }
+  return best
+}
+
+// Cumulative ground distance (meters) from the route start to a snapped
+// position. Collapses "where am I on this route" to a single scalar, which is
+// what lets a caller keep progress strictly monotonic: comparing segment
+// indices alone cannot tell forward drift from backward drift within one
+// segment.
+export function routeProgressMeters(coords, snap) {
+  if (!snap || !coords?.length) return 0
+  let m = 0
+  for (let i = 0; i < snap.index; i++) {
+    m += haversineMeters(coords[i][1], coords[i][0], coords[i + 1][1], coords[i + 1][0])
+  }
+  const [aLng, aLat] = coords[snap.index]
+  return m + haversineMeters(aLat, aLng, snap.point[1], snap.point[0])
+}
+
+// The part of `coords` still ahead of the traveller: the snapped position
+// itself, followed by every vertex after the segment it landed on. Drawing this
+// instead of the full route is what makes the line shrink behind the dot.
+export function routeAhead(coords, snap) {
+  if (!snap) return coords
+  return [snap.point, ...coords.slice(snap.index + 1)]
+}
+
 // Format a distance in meters for display.
 export function formatDistance(meters) {
   if (meters == null || Number.isNaN(meters)) return '—'

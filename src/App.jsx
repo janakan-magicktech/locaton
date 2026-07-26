@@ -20,7 +20,13 @@ import {
   saveLocation,
 } from './services/db.js'
 import { fetchShortestRoute } from './services/routing.js'
-import { bearingDegrees, haversineMeters } from './utils/geo.js'
+import {
+  bearingDegrees,
+  haversineMeters,
+  routeAhead,
+  routeProgressMeters,
+  snapToRoute,
+} from './utils/geo.js'
 import './App.css'
 
 // Distance (meters) below which we consider the destination "reached".
@@ -28,6 +34,38 @@ import './App.css'
 // of walking vs driving and works at any of these thresholds.
 const THRESHOLD_OPTIONS = [10, 20, 50]
 const DEFAULT_THRESHOLD_M = 10
+
+// How far off the drawn route (meters) a fix may be and still count as being
+// "on" it. Beyond this the user has left the route (or the fix is bad), so we
+// stop consuming the line rather than snapping to some far-off segment and
+// erasing most of it in one jump.
+//
+// Walking needs this scaled to the reported GPS accuracy rather than fixed: a
+// pedestrian genuinely walks within a few meters of the footway, so a loose
+// fixed value would keep consuming the line even after you wander off, while a
+// tight one would stall on any urban fix with a ±30 m error circle.
+const OFF_ROUTE_MIN_M = 25
+const offRouteLimit = (accuracy) =>
+  Math.max(OFF_ROUTE_MIN_M, (accuracy || 0) * 2)
+
+// Segments to re-search behind the last match. Forward-only snapping would
+// otherwise let one jittery fix around a corner strand progress on the wrong
+// segment permanently; a small look-back lets it recover.
+const ROUTE_LOOKBACK_SEGMENTS = 3
+
+// Minimum ground distance (meters) between the two fixes used for a heading.
+// At a walking pace of ~1.3 m/s, consecutive watchPosition fixes are barely a
+// meter apart — well inside GPS noise — so deriving a bearing from them yields
+// a randomly spinning compass. Holding the previous anchor until the user has
+// actually covered this much makes the heading stable.
+//
+// Scaled by accuracy for the same reason as offRouteLimit: with a +/-20 m error
+// circle, two fixes taken standing still routinely differ by more than a fixed
+// 12 m, so a constant gate stops filtering anything exactly when the signal is
+// worst.
+const MIN_BEARING_MOVE_M = 12
+const bearingMoveLimit = (accuracy) =>
+  Math.max(MIN_BEARING_MOVE_M, (accuracy || 0) * 1.5)
 
 export default function App() {
   const { online, recheck } = useOnlineStatus()
@@ -66,6 +104,14 @@ export default function App() {
   // old trail. Deferring the wipe to the first fix means a trip that never
   // gets a GPS fix leaves any existing saved path intact.
   const trailClearedRef = useRef(false)
+  // How far along the route the user has been confirmed to travel:
+  // { index } is the matched segment, { meters } the distance from the route
+  // start. Kept as a ratchet — see the commit check in onPositionDuringTracking.
+  const routeProgressRef = useRef({ index: 0, meters: -1 })
+  // Bumped once per navigation session. MapView fits the viewport to the route
+  // when this changes — not when the coordinates change, which is now every
+  // single GPS fix.
+  const routeKeyRef = useRef(0)
 
   const refreshLocations = useCallback(() => {
     if (dbReady) setLocations(getSavedLocations())
@@ -158,18 +204,31 @@ export default function App() {
         location.longitude,
       )
 
-      // Bearing from previous point to current (travel direction).
+      // Bearing from the last anchor to the current point (travel direction).
+      // The anchor only advances once the user has actually moved
+      // MIN_BEARING_MOVE_M; until then we keep showing the previous heading
+      // rather than recomputing one from pure GPS jitter.
       let bearing = null
       const prev = prevPointRef.current
       if (prev) {
-        bearing = bearingDegrees(
+        const moved = haversineMeters(
           prev.latitude,
           prev.longitude,
           point.latitude,
           point.longitude,
         )
+        if (moved >= bearingMoveLimit(point.accuracy)) {
+          bearing = bearingDegrees(
+            prev.latitude,
+            prev.longitude,
+            point.latitude,
+            point.longitude,
+          )
+          prevPointRef.current = point
+        }
+      } else {
+        prevPointRef.current = point
       }
-      prevPointRef.current = point
 
       // Log the breadcrumb for future "Follow Previous Path" — only while on a
       // real outbound trip. Replaying a saved path ('previous') must NOT
@@ -188,6 +247,33 @@ export default function App() {
         })
       }
 
+      // Consume the travelled part of the route so the drawn line shrinks
+      // behind the dot, leaving only the road still ahead — the same way a
+      // turn-by-turn app eats its route line as you drive it.
+      let ahead = null
+      const full = session.routeCoordinates
+      if (full && full.length > 1) {
+        const from = Math.max(
+          0,
+          routeProgressRef.current.index - ROUTE_LOOKBACK_SEGMENTS,
+        )
+        const snap = snapToRoute(full, point.latitude, point.longitude, from)
+        if (snap && snap.distanceMeters <= offRouteLimit(point.accuracy)) {
+          // Ratchet: commit only forward movement. At walking pace the
+          // traveller lingers near a segment boundary for many fixes, and GPS
+          // noise makes the nearest-segment match oscillate across it — without
+          // this guard the drawn line visibly grows back a few meters between
+          // fixes. Progress is derived from the absolute position each time
+          // (not accumulated), so the ratchet can lead reality by at most the
+          // along-track GPS error, and never drifts further.
+          const progressed = routeProgressMeters(full, snap)
+          if (progressed > routeProgressRef.current.meters) {
+            routeProgressRef.current = { index: snap.index, meters: progressed }
+            ahead = routeAhead(full, snap)
+          }
+        }
+      }
+
       const reached = remaining <= thresholdRef.current
 
       setTracking((t) =>
@@ -195,9 +281,11 @@ export default function App() {
           ? {
               ...t,
               remaining,
-              bearing,
+              // Keep the last good heading while the user is between anchors.
+              bearing: bearing ?? t.bearing,
               accuracy: point.accuracy,
               reached,
+              ...(ahead ? { routeCoordinates: ahead } : null),
             }
           : t,
       )
@@ -214,11 +302,38 @@ export default function App() {
     (location, mode, routeCoordinates) => {
       prevPointRef.current = null
       trailClearedRef.current = false
-      const session = { location, savedLocationId: location.id, mode }
+      routeProgressRef.current = { index: 0, meters: -1 }
+      routeKeyRef.current += 1
+      const session = {
+        location,
+        savedLocationId: location.id,
+        mode,
+        routeCoordinates, // pristine full route; the drawn copy gets trimmed
+      }
+
+      // Trim once up front so a replayed trail that starts somewhere behind the
+      // user doesn't draw a leading stub before the first fix arrives.
+      let initialRoute = routeCoordinates
+      if (position && routeCoordinates?.length > 1) {
+        const snap = snapToRoute(
+          routeCoordinates,
+          position.latitude,
+          position.longitude,
+        )
+        if (snap && snap.distanceMeters <= offRouteLimit(position.accuracy)) {
+          routeProgressRef.current = {
+            index: snap.index,
+            meters: routeProgressMeters(routeCoordinates, snap),
+          }
+          initialRoute = routeAhead(routeCoordinates, snap)
+        }
+      }
+
       setTracking({
         location,
         mode,
-        routeCoordinates,
+        routeCoordinates: initialRoute,
+        routeKey: routeKeyRef.current,
         remaining: position
           ? haversineMeters(
               position.latitude,
@@ -272,6 +387,7 @@ export default function App() {
 
   const stopTracking = () => {
     prevPointRef.current = null
+    routeProgressRef.current = { index: 0, meters: -1 }
     setTracking(null)
     refreshLocations()
     // Resume the live background watch so the "you" marker keeps following the
@@ -323,6 +439,7 @@ export default function App() {
         currentPoint={position}
         destination={tracking?.location || selectedForRoute || pendingPin}
         routeCoordinates={tracking?.routeCoordinates}
+        routeKey={tracking?.routeKey}
         routeColor={tracking?.mode === 'previous' ? '#a371f7' : '#2f81f7'}
         flyTo={flyTo}
         onMapClick={handleMapClick}

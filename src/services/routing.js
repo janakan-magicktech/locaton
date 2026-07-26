@@ -1,9 +1,20 @@
 // -----------------------------------------------------------------------------
-// Online routing via the OSRM public demo API.
+// Online WALKING routing via OSRM, hosted by FOSSGIS.
 //   Docs: https://project-osrm.org/docs/v5.24.0/api/
 //   Endpoint used:
-//     GET https://router.project-osrm.org/route/v1/driving/
+//     GET https://routing.openstreetmap.de/routed-foot/route/v1/foot/
 //         {lng1},{lat1};{lng2},{lat2}?overview=full&geometries=geojson
+//
+// Why not router.project-osrm.org? That public demo server hosts ONLY the car
+// profile. Requesting /route/v1/foot/ there does not error — it silently
+// returns the driving answer, so you get car geometry (one-ways obeyed,
+// footpaths and pedestrian shortcuts ignored) and a car ETA. Measured on the
+// same 1.9 km trip: the demo server reported 196 s (~35 km/h) for both
+// profiles, while this foot server reports 1502 s (~4.5 km/h).
+//
+// FOSSGIS runs these servers for the OSM community free of charge under a fair
+// use policy — fine for an app that routes on explicit user action, not for
+// bulk querying.
 //
 // Note: OSRM expects coordinates as lng,lat (longitude first).
 //
@@ -24,20 +35,20 @@
 //   }
 // -----------------------------------------------------------------------------
 
-const OSRM_BASE = 'https://router.project-osrm.org/route/v1/driving'
+const OSRM_BASE = 'https://routing.openstreetmap.de/routed-foot/route/v1/foot'
 
-// Fetch the fastest driving route between two points.
+// Fetch the fastest walking route between two points.
 //
-// OSRM's cost model already minimizes *travel time* across the whole road
-// network — it will route through smaller lanes/side roads when they are
-// quicker, not just along main roads. We additionally ask for `alternatives`
-// so OSRM proposes a few distinct routes, then explicitly pick the one with the
-// lowest `duration` (fastest), returning the rest so the UI can offer choices.
+// The foot profile routes over footways, paths, steps and pedestrian areas, and
+// ignores one-way restrictions that only bind vehicles — so it will happily
+// send you down a lane a car would have to drive around. We ask for
+// `alternatives` so OSRM proposes a few distinct routes, then explicitly pick
+// the one with the lowest `duration`, returning the rest so the UI can offer
+// choices.
 //
-// NOTE: the free public OSRM demo uses *static* free-flow speeds — it has no
-// live traffic data. Genuinely traffic-aware "avoid congestion" routing needs a
-// keyed provider (Mapbox driving-traffic, TomTom, HERE); swapping providers is
-// a single-file change here.
+// Durations assume a constant ~4.5 km/h walking pace: no traffic model, and no
+// allowance for gradient, crowds or waiting at crossings. Treat the ETA as a
+// flat-ground estimate.
 //
 // `from` and `to` are { latitude, longitude }.
 // Returns:

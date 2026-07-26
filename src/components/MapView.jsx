@@ -24,6 +24,9 @@ const ROUTE_LAYER = 'route-line-layer'
 //   currentPoint      { latitude, longitude } | null  -> "you" marker
 //   destination       { latitude, longitude } | null  -> destination marker
 //   routeCoordinates  [[lng,lat],...] | null           -> route/breadcrumb line
+//   routeKey          id that changes once per route; the viewport is fitted
+//                     only when it changes, since routeCoordinates now shrinks
+//                     on every GPS fix as the travelled part is consumed
 //   routeColor        line color (differs for shortest vs recorded path)
 //   flyTo             [lng, lat] | null -> recenter the map when this changes
 //   onMapClick        (lngLat) => void  fired when the user clicks the map
@@ -32,6 +35,7 @@ export default function MapView({
   currentPoint,
   destination,
   routeCoordinates,
+  routeKey,
   routeColor = '#2f81f7',
   flyTo,
   onMapClick,
@@ -42,6 +46,7 @@ export default function MapView({
   const destMarkerRef = useRef(null)
   const onMapClickRef = useRef(onMapClick)
   const loadedRef = useRef(false)
+  const lastFitKeyRef = useRef(null)
 
   // Keep the latest click handler without re-binding the map listener.
   useEffect(() => {
@@ -147,8 +152,17 @@ export default function MapView({
       if (map.getLayer(ROUTE_LAYER)) {
         map.setPaintProperty(ROUTE_LAYER, 'line-color', routeColor)
       }
-      // Fit the map to the route when we have one.
-      if (routeCoordinates && routeCoordinates.length > 1) {
+      // Fit the map to the route once per route. Guarding on routeKey rather
+      // than the coordinates matters now that the line is re-trimmed on every
+      // position fix — fitting each time would yank the viewport continuously
+      // and zoom ever tighter as the remaining route shrinks.
+      if (
+        routeKey != null &&
+        routeKey !== lastFitKeyRef.current &&
+        routeCoordinates &&
+        routeCoordinates.length > 1
+      ) {
+        lastFitKeyRef.current = routeKey
         const bounds = routeCoordinates.reduce(
           (b, c) => b.extend(c),
           new maplibregl.LngLatBounds(routeCoordinates[0], routeCoordinates[0]),
@@ -158,7 +172,7 @@ export default function MapView({
     }
     if (loadedRef.current) apply()
     else map.once('load', apply)
-  }, [routeCoordinates, routeColor])
+  }, [routeCoordinates, routeKey, routeColor])
 
   return <div ref={containerRef} className="map-container" />
 }
