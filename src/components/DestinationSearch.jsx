@@ -1,22 +1,40 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { geocodeDestination } from '../services/geocoding.js'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { geocodeDestination, HAS_ENHANCED_SEARCH } from '../services/geocoding.js'
+import { getUserLocation } from '../services/userLocation.js'
+import { formatDistance } from '../utils/geo.js'
 
 // Lets the user type a destination manually. Suggestions appear as they type
-// (debounced, Photon only) and pressing Search runs the fuller lookup that also
-// queries Nominatim. Picking a result calls onPick({label, latitude, longitude})
-// so the parent can drop a pin the map auto-marks.
+// (debounced) from Photon, Nominatim and local OpenStreetMap POI lookup.
+// Picking a result calls onPick({label, latitude, longitude}) so the parent
+// can drop a pin the map auto-marks.
 //
-// `origin` is the user's current position when known; it biases results towards
-// places near them instead of anywhere in the country.
-const DEBOUNCE_MS = 350
-const MIN_SUGGEST_CHARS = 3
+// `origin` is the user's current position when known; results are ranked
+// nearest-first for the same place name (Pick Me style).
+const DEBOUNCE_MS = 450
+const MIN_SUGGEST_CHARS = 2
+const SEARCH_LIMIT = 20
 
-export default function DestinationSearch({ onPick, origin = null }) {
+export default function DestinationSearch({ onPick, origin = null, areaLabel = null }) {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState(null) // null = nothing to show yet
   const [searching, setSearching] = useState(false)
   const [error, setError] = useState(null)
   const [active, setActive] = useState(-1) // keyboard-highlighted row
+
+  // Always use the latest stored GPS fix for search bias (Pick Me / Uber style).
+  const originRef = useRef(origin)
+  originRef.current = origin ?? getUserLocation()
+
+  const nearestIndex = useMemo(() => {
+    if (!results?.length) return -1
+    let best = 0
+    for (let i = 1; i < results.length; i++) {
+      const d = results[i].distanceMeters
+      const b = results[best].distanceMeters
+      if (d != null && b != null && d < b) best = i
+    }
+    return best
+  }, [results])
 
   // Tracks the in-flight request so a stale response cannot overwrite a newer
   // one, and so an abandoned keystroke is cancelled rather than left running.
@@ -34,9 +52,11 @@ export default function DestinationSearch({ onPick, origin = null }) {
       if (!suggest) setSearching(true)
       setError(null)
       try {
+        const searchOrigin = originRef.current
         const matches = await geocodeDestination(text, {
-          origin,
+          origin: searchOrigin,
           suggest,
+          limit: SEARCH_LIMIT,
           signal: controller.signal,
         })
         if (controller.signal.aborted) return
@@ -113,12 +133,29 @@ export default function DestinationSearch({ onPick, origin = null }) {
     <form className="destination-search" onSubmit={submit}>
       <label>
         Enter a destination
+        {originRef.current && (
+          <span className="search-near-you">
+            {' '}
+            · searching near {areaLabel || 'your location'} — nearest first
+            {HAS_ENHANCED_SEARCH ? ' · enhanced places' : ''}
+          </span>
+        )}
+      </label>
+
+      {!HAS_ENHANCED_SEARCH && (
+        <p className="hint search-upgrade-hint">
+          Using OpenStreetMap (free). For Google Maps–level place search, add a free
+          Geoapify key — see <code>.env.example</code>.
+        </p>
+      )}
+
+      <label className="search-input-row">
         <div className="row-buttons">
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKeyDown}
-            placeholder="e.g. Kandy, Colombo 7, Trinco, or 6.9271, 79.8612"
+            placeholder="e.g. Venus Hospital, Kandy, Colombo 7"
             autoComplete="off"
             spellCheck={false}
           />
@@ -147,7 +184,15 @@ export default function DestinationSearch({ onPick, origin = null }) {
                 onMouseEnter={() => setActive(i)}
                 title={r.context ? `${r.label} — ${r.context}` : r.label}
               >
-                <span className="result-name">📍 {r.label}</span>
+                <span className="result-row">
+                  <span className="result-name">📍 {r.label}</span>
+                  {originRef.current && r.distanceMeters != null && (
+                    <span className="result-distance">
+                      {i === nearestIndex ? 'Nearest · ' : ''}
+                      {formatDistance(r.distanceMeters)}
+                    </span>
+                  )}
+                </span>
                 {r.context && <span className="result-context">{r.context}</span>}
               </button>
             </li>

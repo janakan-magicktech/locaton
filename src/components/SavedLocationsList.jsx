@@ -18,7 +18,24 @@ export default function SavedLocationsList({
 
   return (
     <ul className="saved-list">
-      {locations.map((loc) => {
+      {[...locations]
+        .sort((a, b) => {
+          if (!currentPoint) return 0
+          const da = haversineMeters(
+            currentPoint.latitude,
+            currentPoint.longitude,
+            a.latitude,
+            a.longitude,
+          )
+          const db = haversineMeters(
+            currentPoint.latitude,
+            currentPoint.longitude,
+            b.latitude,
+            b.longitude,
+          )
+          return da - db
+        })
+        .map((loc) => {
         const distance = currentPoint
           ? haversineMeters(
               currentPoint.latitude,

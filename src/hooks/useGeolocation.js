@@ -7,6 +7,12 @@ import {
   toPoint,
   watchPosition,
 } from '../services/geolocation.js'
+import { reverseGeocodeArea } from '../services/geocoding.js'
+import {
+  getUserLocation,
+  setUserAreaLabel,
+  setUserLocation,
+} from '../services/userLocation.js'
 
 // Manages geolocation permission state, one-shot position, and live watching.
 //
@@ -19,9 +25,28 @@ import {
 //   stopWatch    clearWatch cleanly
 export function useGeolocation() {
   const [permission, setPermission] = useState('unknown')
-  const [position, setPosition] = useState(null)
+  const [position, setPosition] = useState(() => getUserLocation())
+  const [areaLabel, setAreaLabel] = useState(null)
   const [error, setError] = useState(null)
   const watchIdRef = useRef(null)
+  const areaFetchedRef = useRef(false)
+
+  const rememberPosition = useCallback((point) => {
+    setUserLocation(point)
+    setPosition(point)
+  }, [])
+
+  // Resolve city/town name once for "Searching near Jaffna" style hints.
+  useEffect(() => {
+    if (!position || areaFetchedRef.current) return
+    areaFetchedRef.current = true
+    reverseGeocodeArea(position.latitude, position.longitude).then((label) => {
+      if (label) {
+        setUserAreaLabel(label)
+        setAreaLabel(label)
+      }
+    })
+  }, [position])
 
   // Track permission state reactively.
   useEffect(() => {
@@ -38,7 +63,7 @@ export function useGeolocation() {
     try {
       const pos = await getCurrentPosition()
       const point = toPoint(pos)
-      setPosition(point)
+      rememberPosition(point)
       setPermission('granted')
       return point
     } catch (err) {
@@ -47,7 +72,7 @@ export function useGeolocation() {
       if (err && err.code === 1) setPermission('denied')
       throw err
     }
-  }, [])
+  }, [rememberPosition])
 
   const startWatch = useCallback((onEach) => {
     // Guard against duplicate watchers.
@@ -55,7 +80,7 @@ export function useGeolocation() {
     watchIdRef.current = watchPosition(
       (pos) => {
         const point = toPoint(pos)
-        setPosition(point)
+        rememberPosition(point)
         setError(null)
         if (onEach) onEach(point)
       },
@@ -64,7 +89,7 @@ export function useGeolocation() {
         if (err && err.code === 1) setPermission('denied')
       },
     )
-  }, [])
+  }, [rememberPosition])
 
   const stopWatch = useCallback(() => {
     if (watchIdRef.current != null) {
@@ -76,5 +101,5 @@ export function useGeolocation() {
   // Cleanup on unmount.
   useEffect(() => () => stopWatch(), [stopWatch])
 
-  return { permission, position, error, requestOnce, startWatch, stopWatch }
+  return { permission, position, areaLabel, error, requestOnce, startWatch, stopWatch }
 }

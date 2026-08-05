@@ -26,6 +26,9 @@ export default function SaveLocationForm({ pin, onSave, onCancel, isCurrent }) {
       <p className="coords">
         {pin.latitude.toFixed(6)}, {pin.longitude.toFixed(6)}
       </p>
+      {isCurrent && (
+        <p className="hint">A red marker on the map shows this is your location.</p>
+      )}
 
       <label>
         Name (optional)

@@ -1,27 +1,16 @@
 import { useEffect, useRef } from 'react'
 import maplibregl from 'maplibre-gl'
+import { MAP_ATTRIBUTION, MAP_STYLE } from '../config.js'
 
-// Online raster tile style (OpenStreetMap tiles via MapLibre raster source).
-// Purely online — no offline tile cache.
-const MAP_STYLE = {
-  version: 8,
-  sources: {
-    osm: {
-      type: 'raster',
-      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-      tileSize: 256,
-      attribution: '© OpenStreetMap contributors',
-    },
-  },
-  layers: [{ id: 'osm', type: 'raster', source: 'osm' }],
-}
+// Vector map — OpenFreeMap (free) or Geoapify OSM Bright when API key is set.
 
 const ROUTE_SOURCE = 'route-line'
 const ROUTE_LAYER = 'route-line-layer'
 
 // Props:
 //   center            [lng, lat] initial center
-//   currentPoint      { latitude, longitude } | null  -> "you" marker
+//   currentPoint      { latitude, longitude } | null  -> live GPS dot
+//   myLocationPin     { latitude, longitude } | null  -> red "you are here" pin
 //   destination       { latitude, longitude } | null  -> destination marker
 //   routeCoordinates  [[lng,lat],...] | null           -> route/breadcrumb line
 //   routeKey          id that changes once per route; the viewport is fitted
@@ -33,6 +22,7 @@ const ROUTE_LAYER = 'route-line-layer'
 export default function MapView({
   center = [0, 0],
   currentPoint,
+  myLocationPin,
   destination,
   routeCoordinates,
   routeKey,
@@ -43,6 +33,7 @@ export default function MapView({
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const currentMarkerRef = useRef(null)
+  const myLocationMarkerRef = useRef(null)
   const destMarkerRef = useRef(null)
   const onMapClickRef = useRef(onMapClick)
   const loadedRef = useRef(false)
@@ -63,6 +54,10 @@ export default function MapView({
     })
     mapRef.current = map
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
+    map.addControl(
+      new maplibregl.AttributionControl({ compact: true, customAttribution: MAP_ATTRIBUTION }),
+      'bottom-right',
+    )
 
     map.on('load', () => {
       loadedRef.current = true
@@ -91,10 +86,16 @@ export default function MapView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Current-location marker (blue dot).
+  // Live GPS dot — hidden while the red "You are here" pin is on screen.
   useEffect(() => {
     const map = mapRef.current
-    if (!map || !currentPoint) return
+    if (!map || !currentPoint || myLocationPin) {
+      if (currentMarkerRef.current) {
+        currentMarkerRef.current.remove()
+        currentMarkerRef.current = null
+      }
+      return
+    }
     const lngLat = [currentPoint.longitude, currentPoint.latitude]
     if (!currentMarkerRef.current) {
       const el = document.createElement('div')
@@ -105,7 +106,36 @@ export default function MapView({
     } else {
       currentMarkerRef.current.setLngLat(lngLat)
     }
-  }, [currentPoint])
+  }, [currentPoint, myLocationPin])
+
+  // Pinned "you are here" marker — red arrow shown when user clicks Pin current location.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    if (!myLocationPin) {
+      if (myLocationMarkerRef.current) {
+        myLocationMarkerRef.current.remove()
+        myLocationMarkerRef.current = null
+      }
+      return
+    }
+    const lngLat = [myLocationPin.longitude, myLocationPin.latitude]
+    if (!myLocationMarkerRef.current) {
+      const el = document.createElement('div')
+      el.className = 'marker-my-location'
+      el.innerHTML =
+        '<span class="marker-my-location-label">You are here</span>' +
+        '<span class="marker-my-location-arrow" aria-hidden="true"></span>'
+      myLocationMarkerRef.current = new maplibregl.Marker({
+        element: el,
+        anchor: 'bottom',
+      })
+        .setLngLat(lngLat)
+        .addTo(map)
+    } else {
+      myLocationMarkerRef.current.setLngLat(lngLat)
+    }
+  }, [myLocationPin])
 
   // Destination marker (red pin).
   useEffect(() => {

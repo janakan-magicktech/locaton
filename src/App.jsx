@@ -73,6 +73,7 @@ export default function App() {
   const {
     permission,
     position,
+    areaLabel,
     error: geoError,
     requestOnce,
     startWatch,
@@ -143,6 +144,7 @@ export default function App() {
     try {
       const point = await requestOnce()
       setPendingPin({ ...point, isCurrent: true })
+      setFlyTo([point.longitude, point.latitude])
     } catch {
       /* handled via geoError / permission gate */
     }
@@ -437,7 +439,12 @@ export default function App() {
       <MapView
         center={mapCenter}
         currentPoint={position}
-        destination={tracking?.location || selectedForRoute || pendingPin}
+        myLocationPin={pendingPin?.isCurrent ? pendingPin : null}
+        destination={
+          tracking?.location ||
+          selectedForRoute ||
+          (pendingPin && !pendingPin.isCurrent ? pendingPin : null)
+        }
         routeCoordinates={tracking?.routeCoordinates}
         routeKey={tracking?.routeKey}
         routeColor={tracking?.mode === 'previous' ? '#a371f7' : '#2f81f7'}
@@ -498,6 +505,7 @@ export default function App() {
               <DestinationSearch
                 onPick={handleManualDestination}
                 origin={position}
+                areaLabel={areaLabel}
               />
 
               <label className="threshold-control">

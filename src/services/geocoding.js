@@ -12,7 +12,14 @@
 //      `viewbox` bias.
 //      Docs: https://nominatim.org/release-docs/latest/api/Search/
 //
-// Why both: Nominatim alone misses a lot of Sri Lankan queries because it wants
+//   3. Overpass (https://overpass-api.de/api/interpreter) — direct POI lookup
+//      from the latest OpenStreetMap database inside a bbox around the user.
+//
+//   4. Geoapify (optional, VITE_GEOAPIFY_API_KEY) — Google Maps–style autocomplete
+//      with richer POI coverage. Free tier: 3,000 requests/day.
+//
+// Without a Geoapify key the app uses free OpenStreetMap data (updated regularly,
+// but many new shops/hospitals may be missing compared to Google Maps).
 // a fairly complete string and ranks by global "importance", so small towns,
 // junctions and shops lose out to same-named places abroad. Photon fills those
 // in; Nominatim keeps address lookups sharp.
@@ -25,17 +32,30 @@
 //   * Raw "lat, lon" input is resolved directly, no network call.
 //   * Candidates are de-duplicated and re-ranked by name match, place type and
 //     distance from the user, instead of trusting each provider's own order.
+//     When the user's location is known, nearby matches are fetched first and
+//     shown at the top (Pick Me style): "Venus Hospital" in Jaffna ranks above
+//     the same name in Colombo when you are in Jaffna.
 //
-// Nominatim's usage policy allows ~1 request/second, so it is only queried on
-// an explicit submit. While typing, suggestions come from Photon alone (its
-// public instance is intended for autocomplete). Results are cached per query
-// so backspacing does not re-hit either API.
+// Nominatim's usage policy allows ~1 request/second, so calls are throttled.
+// While typing, Photon + Overpass respond immediately; Nominatim joins when ready.
+// Results are cached per query so backspacing does not re-hit either API.
 // -----------------------------------------------------------------------------
 
 import { haversineMeters } from '../utils/geo.js'
+import { GEOAPIFY_API_KEY, HAS_ENHANCED_SEARCH } from '../config.js'
+import { getUserLocation } from './userLocation.js'
 
 const PHOTON_BASE = 'https://photon.komoot.io/api'
 const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org/search'
+const OVERPASS_BASE = 'https://overpass-api.de/api/interpreter'
+const GEOAPIFY_AUTOCOMPLETE = 'https://api.geoapify.com/v1/geocode/autocomplete'
+const GEOAPIFY_SEARCH = 'https://api.geoapify.com/v1/geocode/search'
+const USER_AGENT = 'find-my-location/1.0 (Sri Lanka place search)'
+
+const DEFAULT_LIMIT = 20
+const PHOTON_MAX = 15
+const NOMINATIM_MAX = 20
+const NOMINATIM_MIN_MS = 1100
 
 // Bounding box covering Sri Lanka (incl. Jaffna peninsula and the south coast).
 const LK_BBOX = { minLon: 79.35, minLat: 5.7, maxLon: 82.1, maxLat: 10.0 }
@@ -139,9 +159,23 @@ const TYPE_BOOSTS = {
   street: -4,
 }
 
+// Words that suggest the user wants a place/POI, not a street name.
+const POI_HINTS = new Set([
+  'hospital', 'clinic', 'pharmacy', 'medical', 'doctor', 'dental',
+  'restaurant', 'hotel', 'school', 'bank', 'atm', 'shop', 'store',
+  'temple', 'church', 'mosque', 'kovil', 'station', 'airport', 'cafe',
+  'supermarket', 'market', 'college', 'university', 'police', 'office',
+  'mall', 'gym', 'salon', 'garage', 'petrol', 'fuel', 'stand', 'park',
+  'library', 'museum', 'theatre', 'cinema', 'hotel', 'lodge', 'inn',
+])
+
 // Small in-memory cache so re-typing/backspacing does not re-hit the providers.
 const cache = new Map()
-const CACHE_LIMIT = 60
+const CACHE_LIMIT = 80
+
+// Nominatim rate-limit guard (public instance: ~1 req/s).
+let nominatimChain = Promise.resolve()
+let lastNominatimAt = 0
 
 const normalize = (s) =>
   (s || '')
@@ -233,7 +267,34 @@ function buildContext(parts, { inSriLanka }) {
 
 // --- providers --------------------------------------------------------------
 
-async function fetchPhoton(query, { origin, limit, restrictToLK, signal }) {
+// Build a bounding box around a point. Used to fetch nearby places first when
+// the user's location is known.
+function bboxAround(latitude, longitude, radiusKm) {
+  const latDelta = radiusKm / 111
+  const lonDelta = radiusKm / (111 * Math.cos((latitude * Math.PI) / 180))
+  return {
+    minLat: latitude - latDelta,
+    maxLat: latitude + latDelta,
+    minLon: longitude - lonDelta,
+    maxLon: longitude + lonDelta,
+  }
+}
+
+// Clip a bbox to stay inside Sri Lanka.
+function clipToLK(bbox) {
+  return {
+    minLat: Math.max(bbox.minLat, LK_BBOX.minLat),
+    maxLat: Math.min(bbox.maxLat, LK_BBOX.maxLat),
+    minLon: Math.max(bbox.minLon, LK_BBOX.minLon),
+    maxLon: Math.min(bbox.maxLon, LK_BBOX.maxLon),
+  }
+}
+
+function bboxParam(bbox) {
+  return `${bbox.minLon},${bbox.minLat},${bbox.maxLon},${bbox.maxLat}`
+}
+
+async function fetchPhoton(query, { origin, limit, bbox, restrictToLK, signal }) {
   const bias = origin || LK_CENTER
   const params = new URLSearchParams({
     q: query,
@@ -242,14 +303,16 @@ async function fetchPhoton(query, { origin, limit, restrictToLK, signal }) {
     lat: String(bias.latitude),
     lon: String(bias.longitude),
   })
-  if (restrictToLK) {
-    params.set(
-      'bbox',
-      `${LK_BBOX.minLon},${LK_BBOX.minLat},${LK_BBOX.maxLon},${LK_BBOX.maxLat}`,
-    )
+  if (bbox) {
+    params.set('bbox', bboxParam(bbox))
+  } else if (restrictToLK) {
+    params.set('bbox', bboxParam(LK_BBOX))
   }
 
-  const res = await fetch(`${PHOTON_BASE}?${params.toString()}`, { signal })
+  const res = await fetch(`${PHOTON_BASE}?${params.toString()}`, {
+    signal,
+    headers: { 'Accept-Language': 'en' },
+  })
   if (!res.ok) throw new Error(`Place search failed (HTTP ${res.status})`)
   const data = await res.json()
 
@@ -284,14 +347,14 @@ async function fetchPhoton(query, { origin, limit, restrictToLK, signal }) {
     .filter(Boolean)
 }
 
-async function fetchNominatim(query, { limit, restrictToLK, signal }) {
+async function fetchNominatim(query, { origin, limit, restrictToLK, signal }) {
   const params = new URLSearchParams({
     q: query,
     format: 'jsonv2',
     addressdetails: '1',
     namedetails: '1',
     dedupe: '1',
-    limit: String(limit),
+    limit: String(Math.min(limit, NOMINATIM_MAX)),
   })
   if (restrictToLK) {
     params.set('countrycodes', LK_COUNTRY_CODE)
@@ -303,7 +366,10 @@ async function fetchNominatim(query, { limit, restrictToLK, signal }) {
 
   const res = await fetch(`${NOMINATIM_BASE}?${params.toString()}`, {
     signal,
-    headers: { 'Accept-Language': 'en' },
+    headers: {
+      'Accept-Language': 'en',
+      'User-Agent': USER_AGENT,
+    },
   })
   if (!res.ok) throw new Error(`Address lookup failed (HTTP ${res.status})`)
   const data = await res.json()
@@ -344,6 +410,170 @@ async function fetchNominatim(query, { limit, restrictToLK, signal }) {
     .filter(Boolean)
 }
 
+function mapGeoapifyFeature(f, i) {
+  const p = f.properties || {}
+  const inSriLanka = (p.country_code || '').toLowerCase() === LK_COUNTRY_CODE
+  const label =
+    p.name ||
+    p.address_line1 ||
+    p.street ||
+    (p.formatted || '').split(',')[0] ||
+    null
+  if (!label) return null
+  return {
+    label,
+    context: buildContext(
+      [
+        p.name && p.street ? p.street : null,
+        p.suburb || p.district,
+        p.city || p.county,
+        p.state,
+        p.country,
+      ],
+      { inSriLanka },
+    ),
+    latitude: p.lat,
+    longitude: p.lon,
+    inSriLanka,
+    placeType: p.result_type || p.category,
+    source: 'geoapify',
+    rank: i,
+  }
+}
+
+// Geoapify — closest free alternative to Google Places (needs VITE_GEOAPIFY_API_KEY).
+async function fetchGeoapify(query, { origin, limit, signal, fullSearch = false }) {
+  if (!GEOAPIFY_API_KEY) return []
+
+  const params = new URLSearchParams({
+    text: query,
+    limit: String(Math.min(limit, 20)),
+    lang: 'en',
+    format: 'json',
+    apiKey: GEOAPIFY_API_KEY,
+    filter: `countrycode:${LK_COUNTRY_CODE}`,
+  })
+  if (origin) {
+    params.set('bias', `proximity:${origin.longitude},${origin.latitude}`)
+  }
+
+  const base = fullSearch ? GEOAPIFY_SEARCH : GEOAPIFY_AUTOCOMPLETE
+  try {
+    const res = await fetch(`${base}?${params.toString()}`, { signal })
+    if (!res.ok) return []
+    const data = await res.json()
+    return (data?.features || [])
+      .map(mapGeoapifyFeature)
+      .filter((r) => r && Number.isFinite(r.latitude) && Number.isFinite(r.longitude))
+  } catch {
+    return []
+  }
+}
+
+export { HAS_ENHANCED_SEARCH }
+
+function escapeOverpassRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+// Query OpenStreetMap directly for named POIs near the user. Uses the live OSM
+// database so newly mapped shops and hospitals appear sooner than in geocoders.
+async function fetchOverpassLocal(query, { origin, limit, radiusKm = 60, signal }) {
+  if (!origin) return []
+  const raw = query.trim()
+  if (raw.length < 2) return []
+
+  const bbox = clipToLK(bboxAround(origin.latitude, origin.longitude, radiusKm))
+  const pattern = escapeOverpassRegex(raw)
+  const ql = `[out:json][timeout:12];
+(
+  node["name"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+  node["brand"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+  node["operator"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+  node["alt_name"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+  way["name"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+  way["brand"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+  relation["name"~"${pattern}",i](${bbox.minLat},${bbox.minLon},${bbox.maxLat},${bbox.maxLon});
+);
+out center ${Math.min(limit + 5, 25)};`
+
+  try {
+    const res = await fetch(OVERPASS_BASE, {
+      method: 'POST',
+      body: `data=${encodeURIComponent(ql)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      signal,
+    })
+    if (!res.ok) return []
+    const data = await res.json()
+    if (!Array.isArray(data?.elements)) return []
+
+    return data.elements
+      .map((el, i) => {
+        const lat = el.lat ?? el.center?.lat
+        const lon = el.lon ?? el.center?.lon
+        const tags = el.tags || {}
+        const name = tags.name || tags['name:en']
+        if (!name || !Number.isFinite(lat) || !Number.isFinite(lon)) return null
+
+        const inSriLanka =
+          lat >= LK_BBOX.minLat &&
+          lat <= LK_BBOX.maxLat &&
+          lon >= LK_BBOX.minLon &&
+          lon <= LK_BBOX.maxLon
+
+        return {
+          label: name,
+          context: buildContext(
+            [
+              tags['addr:street'],
+              tags['addr:city'] || tags['addr:town'] || tags['addr:suburb'],
+              tags['addr:state'] || tags['addr:district'],
+            ],
+            { inSriLanka },
+          ),
+          latitude: lat,
+          longitude: lon,
+          inSriLanka,
+          placeType: tags.amenity || tags.shop || tags.tourism || tags.healthcare || el.type,
+          source: 'overpass',
+          rank: i,
+        }
+      })
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function fetchNominatimThrottled(query, options) {
+  nominatimChain = nominatimChain.then(async () => {
+    const wait = Math.max(0, NOMINATIM_MIN_MS - (Date.now() - lastNominatimAt))
+    if (wait) await new Promise((r) => setTimeout(r, wait))
+    lastNominatimAt = Date.now()
+    return fetchNominatim(query, options)
+  })
+  return nominatimChain
+}
+
+function looksLikePoiQuery(queryTokens) {
+  return queryTokens.some((t) => POI_HINTS.has(t)) || queryTokens.length >= 2
+}
+
+function isRoadLike(r) {
+  const t = (r.placeType || '').toLowerCase()
+  return t === 'road' || t === 'street' || t === 'residential' || t === 'footway' || t === 'path'
+}
+
+// Drop "Hospital Road" style hits when the user clearly wanted a hospital POI.
+function filterIrrelevantRoads(results, { queryKey, queryTokens }) {
+  if (!looksLikePoiQuery(queryTokens)) return results
+  return results.filter((r) => {
+    if (!isRoadLike(r)) return true
+    return nameScore(r, queryKey, queryTokens) >= 40
+  })
+}
+
 // --- merge, rank, dedupe ----------------------------------------------------
 
 // How well the result's own name matches what was typed. This dominates the
@@ -367,20 +597,54 @@ function nameScore(r, queryKey, queryTokens) {
   return Math.round((hit / queryTokens.length) * 10) - 20
 }
 
+function distanceMetersFrom(r, origin) {
+  const from = origin || LK_CENTER
+  return haversineMeters(from.latitude, from.longitude, r.latitude, r.longitude)
+}
+
+// Name-match tier kept for reference; ranking uses distance-first when origin known.
+
 function scoreResult(r, { queryKey, queryTokens, origin }) {
   let score = 100 - r.rank * 4
 
-  score += nameScore(r, queryKey, queryTokens)
+  score += r.nameScore ?? nameScore(r, queryKey, queryTokens)
   if (r.inSriLanka) score += 25
   score += TYPE_BOOSTS[r.placeType] ?? 0
   score += (r.importance || 0) * 25
 
   // Prefer nearby matches: no penalty within ~10 km, growing slowly after.
-  const from = origin || LK_CENTER
-  const km = haversineMeters(from.latitude, from.longitude, r.latitude, r.longitude) / 1000
+  const km = (r.distanceMeters ?? distanceMetersFrom(r, origin)) / 1000
   score -= Math.min(45, Math.max(0, Math.log2(Math.max(km, 10) / 10) * 7))
 
   return score
+}
+
+// Rank results Pick Me / Uber style: when we know where the user is, sort by
+// distance first among anything that plausibly matches what they typed.
+function rankResults(results, { queryKey, queryTokens, origin }) {
+  const enriched = results.map((r) => ({
+    ...r,
+    nameScore: nameScore(r, queryKey, queryTokens),
+    distanceMeters: distanceMetersFrom(r, origin),
+  }))
+
+  const viable = enriched.filter((r) => r.nameScore >= -15)
+
+  if (origin) {
+    viable.sort((a, b) => {
+      const dist = a.distanceMeters - b.distanceMeters
+      if (Math.abs(dist) > 50) return dist
+      if (b.nameScore !== a.nameScore) return b.nameScore - a.nameScore
+      return 0
+    })
+    return viable
+  }
+
+  viable.forEach((r) => {
+    r.score = scoreResult(r, { queryKey, queryTokens, origin })
+  })
+  viable.sort((a, b) => b.score - a.score)
+  return viable
 }
 
 // Collapse the two providers' overlapping hits: same place name within 250 m,
@@ -418,14 +682,52 @@ function cacheSet(key, value) {
 }
 
 // Run one pass of the providers, either Sri Lanka-restricted or worldwide.
+// When the user's location is known, a tight local bbox is queried first so
+// nearby POIs (hospitals, shops, etc.) are included before country-wide hits.
 async function runPass(query, { origin, limit, signal, suggest, restrictToLK }) {
-  const providers = [
-    fetchPhoton(query, { origin, limit: limit + 5, restrictToLK, signal }),
-  ]
-  // Nominatim only on explicit submit — its public instance is rate limited.
-  if (!suggest) {
-    providers.push(fetchNominatim(query, { limit, restrictToLK, signal }))
+  const fetchLimit = Math.min(limit + 8, PHOTON_MAX + 5)
+  const providers = []
+
+  // Geoapify first when configured — richest POI database (Google Maps–like).
+  if (GEOAPIFY_API_KEY && restrictToLK) {
+    providers.push(
+      fetchGeoapify(query, { origin, limit: fetchLimit, signal, fullSearch: !suggest }),
+    )
   }
+
+  if (origin && restrictToLK) {
+    // Search nearby first (Pick Me style): 25 km, then 80 km, then country-wide.
+    for (const radiusKm of [25, 80]) {
+      providers.push(
+        fetchPhoton(query, {
+          origin,
+          limit: fetchLimit,
+          bbox: clipToLK(bboxAround(origin.latitude, origin.longitude, radiusKm)),
+          signal,
+        }),
+        fetchOverpassLocal(query, { origin, limit: fetchLimit, radiusKm, signal }),
+      )
+    }
+  }
+
+  providers.push(
+    fetchPhoton(query, {
+      origin,
+      limit: fetchLimit,
+      restrictToLK,
+      signal,
+    }),
+  )
+
+  // Nominatim is throttled (~1 req/s) but included while typing for more hits.
+  providers.push(
+    fetchNominatimThrottled(query, {
+      origin,
+      limit: fetchLimit,
+      restrictToLK,
+      signal,
+    }),
+  )
 
   const settled = await Promise.allSettled(providers)
   const ok = settled.filter((s) => s.status === 'fulfilled')
@@ -442,14 +744,14 @@ async function runPass(query, { origin, limit, signal, suggest, restrictToLK }) 
 //
 //   query   raw string the user typed
 //   origin  optional {latitude, longitude} of the user, used for distance bias
-//   limit   max results to return (default 8)
+//   limit   max results to return (default 15)
 //   signal  optional AbortSignal so a stale keystroke can be cancelled
-//   suggest true while the user is still typing — Photon only, keeps Nominatim
-//           within its rate limit
+//   suggest true while the user is still typing
 //
-// Returns [{ label, context, latitude, longitude }, ...] (possibly empty).
+// Returns [{ label, context, latitude, longitude, distanceMeters? }, ...].
 export async function geocodeDestination(query, options = {}) {
-  const { origin = null, limit = 8, signal, suggest = false } = options
+  const { origin = null, limit = DEFAULT_LIMIT, signal, suggest = false } = options
+  const searchOrigin = origin ?? getUserLocation()
   const raw = (query || '').trim()
   if (!raw) return []
 
@@ -459,12 +761,15 @@ export async function geocodeDestination(query, options = {}) {
   const searchText = expandLocalQuery(raw)
   const queryKey = normalize(searchText)
   const queryTokens = queryKey.split(' ').filter(Boolean)
-  const cacheKey = `${suggest ? 's' : 'f'}|${limit}|${queryKey}`
+  const originKey = searchOrigin
+    ? `${searchOrigin.latitude.toFixed(2)},${searchOrigin.longitude.toFixed(2)}`
+    : 'none'
+  const cacheKey = `v3|${HAS_ENHANCED_SEARCH ? 'g' : 'o'}|${suggest ? 's' : 'f'}|${limit}|${originKey}|${queryKey}`
   const cached = cacheGet(cacheKey)
   if (cached) return cached
 
   let hits = await runPass(searchText, {
-    origin,
+    origin: searchOrigin,
     limit,
     signal,
     suggest,
@@ -481,7 +786,7 @@ export async function geocodeDestination(query, options = {}) {
   if (hits.length < 3 || !strongLocalMatch) {
     try {
       const global = await runPass(searchText, {
-        origin,
+        origin: searchOrigin,
         limit,
         signal,
         suggest,
@@ -494,10 +799,13 @@ export async function geocodeDestination(query, options = {}) {
   }
 
   const ranked = dedupe(
-    hits
-      .filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude))
-      .map((r) => ({ ...r, score: scoreResult(r, { queryKey, queryTokens, origin }) }))
-      .sort((a, b) => b.score - a.score),
+    rankResults(
+      filterIrrelevantRoads(
+        hits.filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude)),
+        { queryKey, queryTokens },
+      ),
+      { queryKey, queryTokens, origin: searchOrigin },
+    ),
   ).slice(0, limit)
 
   cacheSet(cacheKey, ranked)
@@ -507,4 +815,37 @@ export async function geocodeDestination(query, options = {}) {
 // Convenience wrapper for as-you-type suggestions.
 export function suggestDestinations(query, options = {}) {
   return geocodeDestination(query, { ...options, suggest: true })
+}
+
+// Resolve the user's city/town from coordinates — stored for search context.
+export async function reverseGeocodeArea(latitude, longitude, signal) {
+  const params = new URLSearchParams({
+    lat: String(latitude),
+    lon: String(longitude),
+    format: 'jsonv2',
+    zoom: '14',
+  })
+  try {
+    const res = await fetch(`${NOMINATIM_BASE.replace('/search', '/reverse')}?${params}`, {
+      signal,
+      headers: {
+        'Accept-Language': 'en',
+        'User-Agent': USER_AGENT,
+      },
+    })
+    if (!res.ok) return null
+    const data = await res.json()
+    const a = data?.address || {}
+    return (
+      a.city ||
+      a.town ||
+      a.village ||
+      a.suburb ||
+      a.neighbourhood ||
+      a.state_district ||
+      null
+    )
+  } catch {
+    return null
+  }
 }
