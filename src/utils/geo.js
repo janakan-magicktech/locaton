@@ -98,6 +98,23 @@ export function routeProgressMeters(coords, snap) {
   return m + haversineMeters(aLat, aLng, snap.point[1], snap.point[0])
 }
 
+// Total polyline length and remaining distance ahead of a snap — used to decide
+// whether a freshly calculated route is shorter than the one being followed.
+export function routeTotalMeters(coords) {
+  if (!coords || coords.length < 2) return 0
+  let m = 0
+  for (let i = 0; i < coords.length - 1; i++) {
+    m += haversineMeters(coords[i][1], coords[i][0], coords[i + 1][1], coords[i + 1][0])
+  }
+  return m
+}
+
+export function routeRemainingMeters(coords, snap) {
+  if (!coords || coords.length < 2) return Infinity
+  if (!snap) return routeTotalMeters(coords)
+  return Math.max(0, routeTotalMeters(coords) - routeProgressMeters(coords, snap))
+}
+
 // The part of `coords` still ahead of the traveller: the snapped position
 // itself, followed by every vertex after the segment it landed on. Drawing this
 // instead of the full route is what makes the line shrink behind the dot.

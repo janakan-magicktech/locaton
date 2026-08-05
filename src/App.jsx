@@ -26,6 +26,7 @@ import {
   haversineMeters,
   routeAhead,
   routeProgressMeters,
+  routeRemainingMeters,
   snapToRoute,
 } from './utils/geo.js'
 import './App.css'
@@ -53,6 +54,13 @@ const offRouteLimit = (accuracy) =>
 // otherwise let one jittery fix around a corner strand progress on the wrong
 // segment permanently; a small look-back lets it recover.
 const ROUTE_LOOKBACK_SEGMENTS = 3
+
+// Dynamic reroute (Google Maps style): recalculate when off-route or a side street
+// offers a meaningfully shorter remaining path. Throttled for OSRM fair use.
+const REROUTE_MIN_INTERVAL_MS = 12_000
+const REROUTE_OFFROUTE_MIN_MS = 4_000
+const REROUTE_MIN_MOVE_M = 35
+const REROUTE_SAVINGS_M = 15
 
 // Minimum ground distance (meters) between the two fixes used for a heading.
 // At a walking pace of ~1.3 m/s, consecutive watchPosition fixes are barely a
@@ -97,7 +105,8 @@ export default function App() {
     navigating: isNavigating,
   })
   const displayHeading = userHeading ?? tracking?.bearing ?? null
-  const followHeading = (compassMode || isNavigating) && displayHeading != null
+  // During navigation always use POV camera; rotate when heading is known.
+  const followHeading = compassMode && displayHeading != null
 
   const toggleCompassMode = async () => {
     if (!compassMode) await requestCompassPermission()
@@ -128,6 +137,9 @@ export default function App() {
   // when this changes — not when the coordinates change, which is now every
   // single GPS fix.
   const routeKeyRef = useRef(0)
+  const lastRerouteAtRef = useRef(0)
+  const lastReroutePointRef = useRef(null)
+  const rerouteInFlightRef = useRef(false)
 
   const refreshLocations = useCallback(() => {
     if (dbReady) setLocations(getSavedLocations())
@@ -270,13 +282,14 @@ export default function App() {
       // behind the dot, leaving only the road still ahead — the same way a
       // turn-by-turn app eats its route line as you drive it.
       let ahead = null
+      let snap = null
       const full = session.routeCoordinates
       if (full && full.length > 1) {
         const from = Math.max(
           0,
           routeProgressRef.current.index - ROUTE_LOOKBACK_SEGMENTS,
         )
-        const snap = snapToRoute(full, point.latitude, point.longitude, from)
+        snap = snapToRoute(full, point.latitude, point.longitude, from)
         if (snap && snap.distanceMeters <= offRouteLimit(point.accuracy)) {
           // Ratchet: commit only forward movement. At walking pace the
           // traveller lingers near a segment boundary for many fixes, and GPS
@@ -290,6 +303,71 @@ export default function App() {
             routeProgressRef.current = { index: snap.index, meters: progressed }
             ahead = routeAhead(full, snap)
           }
+        }
+      }
+
+      // Google Maps-style reroute: side streets / shortcuts when they shorten the trip.
+      if (mode === 'shortest' && full?.length > 1) {
+        const offRoute =
+          !snap || snap.distanceMeters > offRouteLimit(point.accuracy)
+        const now = Date.now()
+        const sinceLast = now - lastRerouteAtRef.current
+        const moved = lastReroutePointRef.current
+          ? haversineMeters(
+              lastReroutePointRef.current.latitude,
+              lastReroutePointRef.current.longitude,
+              point.latitude,
+              point.longitude,
+            )
+          : Infinity
+        const shouldTry =
+          !rerouteInFlightRef.current &&
+          (offRoute
+            ? sinceLast >= REROUTE_OFFROUTE_MIN_MS
+            : sinceLast >= REROUTE_MIN_INTERVAL_MS && moved >= REROUTE_MIN_MOVE_M)
+
+        if (shouldTry) {
+          rerouteInFlightRef.current = true
+          const remainingOnCurrent = routeRemainingMeters(full, snap)
+          fetchShortestRoute(point, location)
+            .then((route) => {
+              const adopt =
+                offRoute ||
+                route.distance < remainingOnCurrent - REROUTE_SAVINGS_M
+              if (!adopt) return
+
+              session.routeCoordinates = route.coordinates
+              lastRerouteAtRef.current = Date.now()
+              lastReroutePointRef.current = point
+
+              const freshSnap = snapToRoute(
+                route.coordinates,
+                point.latitude,
+                point.longitude,
+                0,
+              )
+              routeProgressRef.current = freshSnap
+                ? {
+                    index: freshSnap.index,
+                    meters: routeProgressMeters(route.coordinates, freshSnap),
+                  }
+                : { index: 0, meters: -1 }
+
+              setTracking((t) =>
+                t
+                  ? {
+                      ...t,
+                      routeCoordinates: freshSnap
+                        ? routeAhead(route.coordinates, freshSnap)
+                        : route.coordinates,
+                    }
+                  : t,
+              )
+            })
+            .catch(() => {})
+            .finally(() => {
+              rerouteInFlightRef.current = false
+            })
         }
       }
 
@@ -323,6 +401,9 @@ export default function App() {
       trailClearedRef.current = false
       routeProgressRef.current = { index: 0, meters: -1 }
       routeKeyRef.current += 1
+      lastRerouteAtRef.current = 0
+      lastReroutePointRef.current = null
+      rerouteInFlightRef.current = false
       requestCompassPermission()
       const session = {
         location,
@@ -408,6 +489,9 @@ export default function App() {
   const stopTracking = () => {
     prevPointRef.current = null
     routeProgressRef.current = { index: 0, meters: -1 }
+    lastRerouteAtRef.current = 0
+    lastReroutePointRef.current = null
+    rerouteInFlightRef.current = false
     setTracking(null)
     refreshLocations()
     // Resume the live background watch so the "you" marker keeps following the

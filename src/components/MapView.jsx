@@ -146,35 +146,49 @@ export default function MapView({
     }
   }, [heading, followHeading, isNavigating])
 
-  // Navigation / compass — keep you centered; rotate map when heading is known.
+  // Navigation POV — Google Maps style: tilted view, heading up, you near the bottom.
   useEffect(() => {
     const map = mapRef.current
     if (!map || !currentPoint) return
-    if (!isNavigating && !followHeading) return
 
-    const opts = {
-      center: [currentPoint.longitude, currentPoint.latitude],
-      duration: isNavigating ? 200 : 280,
-      essential: true,
-    }
     if (isNavigating) {
-      opts.zoom = Math.max(map.getZoom(), 17)
+      map.easeTo({
+        center: [currentPoint.longitude, currentPoint.latitude],
+        zoom: 18,
+        pitch: 52,
+        bearing: heading ?? map.getBearing(),
+        duration: 220,
+        essential: true,
+        padding: { top: 60, bottom: 240, left: 0, right: 0 },
+      })
+      return
     }
-    if ((followHeading || isNavigating) && heading != null) {
-      opts.bearing = heading
-    }
-    map.easeTo(opts)
-  }, [currentPoint, followHeading, isNavigating, heading])
 
-  // Return to north-up when compass mode is turned off (not while navigating).
+    if (followHeading && heading != null) {
+      map.easeTo({
+        center: [currentPoint.longitude, currentPoint.latitude],
+        bearing: heading,
+        pitch: 0,
+        padding: { top: 0, bottom: 0, left: 0, right: 0 },
+        duration: 280,
+        essential: true,
+      })
+    }
+  }, [currentPoint, isNavigating, followHeading, heading])
+
+  // Flat north-up view when navigation / compass mode ends.
   useEffect(() => {
     const map = mapRef.current
-    if (!map || followHeading || isNavigating) return
-    const b = map.getBearing()
-    if (Math.abs(b) > 0.5) {
-      map.easeTo({ bearing: 0, duration: 400 })
+    if (!map || isNavigating || followHeading) return
+    if (map.getPitch() > 1 || Math.abs(map.getBearing()) > 0.5) {
+      map.easeTo({
+        pitch: 0,
+        bearing: 0,
+        padding: { top: 0, bottom: 0, left: 0, right: 0 },
+        duration: 450,
+      })
     }
-  }, [followHeading, isNavigating])
+  }, [isNavigating, followHeading])
 
   // Pinned "you are here" marker — red arrow shown when user clicks Pin current location.
   useEffect(() => {
@@ -259,7 +273,9 @@ export default function MapView({
       // than the coordinates matters now that the line is re-trimmed on every
       // position fix — fitting each time would yank the viewport continuously
       // and zoom ever tighter as the remaining route shrinks.
+      // Skip overview fit while navigating — the POV camera follows you instead.
       if (
+        !isNavigating &&
         routeKey != null &&
         routeKey !== lastFitKeyRef.current &&
         routeCoordinates &&
@@ -275,7 +291,7 @@ export default function MapView({
     }
     if (loadedRef.current) apply()
     else map.once('load', apply)
-  }, [routeCoordinates, routeKey, routeColor])
+  }, [routeCoordinates, routeKey, routeColor, isNavigating])
 
   return <div ref={containerRef} className="map-container" />
 }
