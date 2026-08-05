@@ -144,8 +144,8 @@ export default function DestinationSearch({ onPick, origin = null, areaLabel = n
 
       {!HAS_ENHANCED_SEARCH && (
         <p className="hint search-upgrade-hint">
-          Using OpenStreetMap (free). For Google Maps–level place search, add a free
-          Geoapify key — see <code>.env.example</code>.
+          Enhanced free search: OpenStreetMap + Open-Meteo + local POIs. Optional Geoapify key
+          adds even richer results — see <code>.env.example</code>.
         </p>
       )}
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import MapView from './components/MapView.jsx'
-import OfflineGate from './components/OfflineGate.jsx'
+import OfflineBanner from './components/OfflineBanner.jsx'
+import PlaceDetailsPanel from './components/PlaceDetailsPanel.jsx'
 import PermissionGate from './components/PermissionGate.jsx'
 import SaveLocationForm from './components/SaveLocationForm.jsx'
 import SavedLocationsList from './components/SavedLocationsList.jsx'
@@ -21,6 +22,15 @@ import {
   saveLocation,
 } from './services/db.js'
 import { fetchShortestRoute } from './services/routing.js'
+import {
+  getOfflineCacheStats,
+  loadRouteCache,
+  prefetchMapStyle,
+  registerOfflineServiceWorker,
+  saveRouteCache,
+} from './services/offlineCache.js'
+import { estimateTraffic } from './services/traffic.js'
+import { MAP_STYLE_STANDARD } from './config.js'
 import {
   bearingDegrees,
   haversineMeters,
@@ -97,6 +107,10 @@ export default function App() {
   const [routeError, setRouteError] = useState(null)
   const [loadingRoute, setLoadingRoute] = useState(false)
   const [compassMode, setCompassMode] = useState(false)
+  const [mapStyle, setMapStyle] = useState('standard')
+  const [showTraffic, setShowTraffic] = useState(true)
+  const [cacheStats, setCacheStats] = useState(null)
+  const [pickedPlace, setPickedPlace] = useState(null)
   const [tracking, setTracking] = useState(null)
   const isNavigating = Boolean(tracking)
 
@@ -149,6 +163,16 @@ export default function App() {
     refreshLocations()
   }, [refreshLocations])
 
+  useEffect(() => {
+    registerOfflineServiceWorker()
+    prefetchMapStyle(MAP_STYLE_STANDARD)
+    getOfflineCacheStats().then(setCacheStats)
+  }, [])
+
+  useEffect(() => {
+    if (online) getOfflineCacheStats().then(setCacheStats)
+  }, [online])
+
   // Live "you" marker: as soon as permission is granted, watch position
   // continuously so the blue dot follows real movement — not just during a
   // navigation session. A tracking session installs its own watch (which
@@ -199,6 +223,7 @@ export default function App() {
       isCurrent: false,
       label: result.label,
     })
+    setPickedPlace(result)
     setFlyTo([result.longitude, result.latitude])
   }, [])
 
@@ -210,6 +235,7 @@ export default function App() {
       longitude: pendingPin.longitude,
     })
     setPendingPin(null)
+    setPickedPlace(null)
     refreshLocations()
   }
 
@@ -337,6 +363,8 @@ export default function App() {
               if (!adopt) return
 
               session.routeCoordinates = route.coordinates
+              session.fullRouteCoordinates = route.coordinates
+              session.steps = route.steps
               lastRerouteAtRef.current = Date.now()
               lastReroutePointRef.current = point
 
@@ -360,6 +388,9 @@ export default function App() {
                       routeCoordinates: freshSnap
                         ? routeAhead(route.coordinates, freshSnap)
                         : route.coordinates,
+                      fullRouteCoordinates: route.coordinates,
+                      steps: route.steps,
+                      routeDuration: route.duration,
                     }
                   : t,
               )
@@ -396,7 +427,7 @@ export default function App() {
   )
 
   const beginTracking = useCallback(
-    (location, mode, routeCoordinates) => {
+    (location, mode, routeCoordinates, navMeta = {}) => {
       prevPointRef.current = null
       trailClearedRef.current = false
       routeProgressRef.current = { index: 0, meters: -1 }
@@ -409,7 +440,9 @@ export default function App() {
         location,
         savedLocationId: location.id,
         mode,
-        routeCoordinates, // pristine full route; the drawn copy gets trimmed
+        routeCoordinates,
+        fullRouteCoordinates: navMeta.fullRouteCoordinates || routeCoordinates,
+        steps: navMeta.steps || null,
       }
 
       // Trim once up front so a replayed trail that starts somewhere behind the
@@ -434,6 +467,9 @@ export default function App() {
         location,
         mode,
         routeCoordinates: initialRoute,
+        fullRouteCoordinates: navMeta.fullRouteCoordinates || routeCoordinates,
+        steps: navMeta.steps || null,
+        routeDuration: navMeta.duration || null,
         routeKey: routeKeyRef.current,
         remaining: position
           ? haversineMeters(
@@ -476,9 +512,22 @@ export default function App() {
     setLoadingRoute(true)
     try {
       const current = position || (await requestOnce())
-      const route = await fetchShortestRoute(current, loc)
+      let route
+      if (!online) {
+        route = loadRouteCache(String(loc.id))
+        if (!route?.coordinates) {
+          throw new Error('Offline — no cached route for this location. Connect once to fetch it.')
+        }
+      } else {
+        route = await fetchShortestRoute(current, loc)
+        saveRouteCache(String(loc.id), route)
+      }
       setSelectedForRoute(null)
-      beginTracking(loc, 'shortest', route.coordinates)
+      beginTracking(loc, 'shortest', route.coordinates, {
+        steps: route.steps,
+        duration: route.duration,
+        fullRouteCoordinates: route.coordinates,
+      })
     } catch (err) {
       setRouteError(err.message || 'Could not fetch route')
     } finally {
@@ -501,8 +550,6 @@ export default function App() {
   }
 
   // --- render gates ----------------------------------------------------------
-
-  if (!online) return <OfflineGate onRetry={recheck} />
 
   if (dbError) {
     return (
@@ -536,8 +583,18 @@ export default function App() {
 
   const mapCenter = [position.longitude, position.latitude]
 
+  const trafficInfo =
+    tracking?.mode === 'shortest' && tracking?.routeDuration != null
+      ? estimateTraffic({
+          latitude: tracking.location.latitude,
+          longitude: tracking.location.longitude,
+          durationSeconds: tracking.routeDuration,
+        })
+      : null
+
   return (
     <div className="app-layout">
+      {!online && <OfflineBanner onRetry={recheck} cacheStats={cacheStats} />}
       <MapView
         center={mapCenter}
         currentPoint={position}
@@ -554,14 +611,18 @@ export default function App() {
         followHeading={followHeading}
         heading={displayHeading}
         isNavigating={isNavigating}
+        mapStyle={mapStyle}
+        onMapStyleChange={setMapStyle}
+        showTraffic={showTraffic && tracking?.mode === 'shortest'}
+        trafficLevel={trafficInfo?.level || 'clear'}
         onMapClick={handleMapClick}
       />
 
       <aside className="sidebar">
         <header className="sidebar-header">
           <h2>Find My Location</h2>
-          <span className="online-dot" title="Online">
-            ● online
+          <span className={`online-dot ${online ? '' : 'offline'}`} title={online ? 'Online' : 'Offline'}>
+            ● {online ? 'online' : 'offline'}
           </span>
         </header>
 
@@ -574,6 +635,11 @@ export default function App() {
             bearing={tracking.bearing}
             reached={tracking.reached}
             onStop={stopTracking}
+            position={position}
+            steps={tracking.steps}
+            fullRouteCoordinates={tracking.fullRouteCoordinates}
+            routeDuration={tracking.routeDuration}
+            trafficInfo={trafficInfo}
           />
         ) : selectedForRoute ? (
           <>
@@ -620,6 +686,22 @@ export default function App() {
                 origin={position}
                 areaLabel={areaLabel}
               />
+
+              {pickedPlace && !tracking && (
+                <PlaceDetailsPanel
+                  place={pickedPlace}
+                  onClose={() => setPickedPlace(null)}
+                />
+              )}
+
+              <label className="traffic-toggle">
+                <input
+                  type="checkbox"
+                  checked={showTraffic}
+                  onChange={(e) => setShowTraffic(e.target.checked)}
+                />
+                Show traffic on route
+              </label>
 
               <label className="threshold-control">
                 Arrival threshold

@@ -1,27 +1,18 @@
 import { useEffect, useRef } from 'react'
 import maplibregl from 'maplibre-gl'
-import { MAP_ATTRIBUTION, MAP_STYLE } from '../config.js'
-
-// Vector map — OpenFreeMap (free) or Geoapify OSM Bright when API key is set.
+import {
+  MAP_ATTRIBUTION,
+  MAP_STYLE_SATELLITE,
+  MAP_STYLE_STANDARD,
+} from '../config.js'
+import MapStyleControl from './MapStyleControl.jsx'
+import { trafficOverlaySegments } from '../services/traffic.js'
 
 const ROUTE_SOURCE = 'route-line'
 const ROUTE_LAYER = 'route-line-layer'
+const TRAFFIC_SOURCE = 'traffic-overlay'
+const TRAFFIC_LAYER = 'traffic-overlay-layer'
 
-// Props:
-//   center            [lng, lat] initial center
-//   currentPoint      { latitude, longitude } | null  -> live GPS dot
-//   myLocationPin     { latitude, longitude } | null  -> red "you are here" pin
-//   destination       { latitude, longitude } | null  -> destination marker
-//   routeCoordinates  [[lng,lat],...] | null           -> route/breadcrumb line
-//   routeKey          id that changes once per route; the viewport is fitted
-//                     only when it changes, since routeCoordinates now shrinks
-//                     on every GPS fix as the travelled part is consumed
-//   routeColor        line color (differs for shortest vs recorded path)
-//   flyTo             [lng, lat] | null -> recenter the map when this changes
-//   followHeading     rotate map so the user's heading points up (Google Maps style)
-//   heading           compass/GPS bearing in degrees (0 = north), or null
-//   isNavigating      true while en route — map follows you, triangle always visible
-//   onMapClick        (lngLat) => void  fired when the user clicks the map
 export default function MapView({
   center = [0, 0],
   currentPoint,
@@ -34,6 +25,10 @@ export default function MapView({
   followHeading = false,
   heading = null,
   isNavigating = false,
+  mapStyle = 'standard',
+  onMapStyleChange,
+  showTraffic = false,
+  trafficLevel = 'clear',
   onMapClick,
 }) {
   const containerRef = useRef(null)
@@ -45,42 +40,66 @@ export default function MapView({
   const loadedRef = useRef(false)
   const lastFitKeyRef = useRef(null)
   const headingMarkerElRef = useRef(null)
+  const mapStyleRef = useRef(mapStyle)
 
-  // Keep the latest click handler without re-binding the map listener.
   useEffect(() => {
     onMapClickRef.current = onMapClick
   }, [onMapClick])
 
-  // Initialize the map once.
   useEffect(() => {
+    const style = mapStyle === 'satellite' ? MAP_STYLE_SATELLITE : MAP_STYLE_STANDARD
+    mapStyleRef.current = mapStyle
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: MAP_STYLE,
+      style,
       center,
       zoom: 14,
     })
     mapRef.current = map
     map.addControl(new maplibregl.NavigationControl(), 'top-right')
     map.addControl(
-      new maplibregl.AttributionControl({ compact: true, customAttribution: MAP_ATTRIBUTION }),
+      new maplibregl.AttributionControl({
+        compact: true,
+        customAttribution: mapStyle === 'satellite' ? '© Esri © OpenStreetMap' : MAP_ATTRIBUTION,
+      }),
       'bottom-right',
     )
 
-    map.on('load', () => {
+    const setupLayers = () => {
       loadedRef.current = true
-      map.addSource(ROUTE_SOURCE, {
-        type: 'geojson',
-        data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } },
-      })
-      map.addLayer({
-        id: ROUTE_LAYER,
-        type: 'line',
-        source: ROUTE_SOURCE,
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': routeColor, 'line-width': 5, 'line-opacity': 0.85 },
-      })
-    })
+      if (!map.getSource(TRAFFIC_SOURCE)) {
+        map.addSource(TRAFFIC_SOURCE, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        })
+        map.addLayer({
+          id: TRAFFIC_LAYER,
+          type: 'line',
+          source: TRAFFIC_SOURCE,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: {
+            'line-color': ['get', 'color'],
+            'line-width': 6,
+            'line-opacity': 0.55,
+          },
+        })
+      }
+      if (!map.getSource(ROUTE_SOURCE)) {
+        map.addSource(ROUTE_SOURCE, {
+          type: 'geojson',
+          data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } },
+        })
+        map.addLayer({
+          id: ROUTE_LAYER,
+          type: 'line',
+          source: ROUTE_SOURCE,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': routeColor, 'line-width': 5, 'line-opacity': 0.85 },
+        })
+      }
+    }
 
+    map.on('load', setupLayers)
     map.on('click', (e) => {
       if (onMapClickRef.current) onMapClickRef.current(e.lngLat)
     })
@@ -93,7 +112,56 @@ export default function MapView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Live GPS — Google Maps-style blue triangle; always visible while moving/navigating.
+  // Switch map style without reinitializing markers logic.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map || mapStyleRef.current === mapStyle) return
+    mapStyleRef.current = mapStyle
+    const style = mapStyle === 'satellite' ? MAP_STYLE_SATELLITE : MAP_STYLE_STANDARD
+    const centerNow = map.getCenter()
+    const zoom = map.getZoom()
+    const bearing = map.getBearing()
+    const pitch = map.getPitch()
+    map.setStyle(style)
+    map.once('style.load', () => {
+      loadedRef.current = true
+      map.setCenter(centerNow)
+      map.setZoom(zoom)
+      map.setBearing(bearing)
+      map.setPitch(pitch)
+      if (!map.getSource(TRAFFIC_SOURCE)) {
+        map.addSource(TRAFFIC_SOURCE, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] },
+        })
+        map.addLayer({
+          id: TRAFFIC_LAYER,
+          type: 'line',
+          source: TRAFFIC_SOURCE,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: {
+            'line-color': ['get', 'color'],
+            'line-width': 6,
+            'line-opacity': 0.55,
+          },
+        })
+      }
+      if (!map.getSource(ROUTE_SOURCE)) {
+        map.addSource(ROUTE_SOURCE, {
+          type: 'geojson',
+          data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } },
+        })
+        map.addLayer({
+          id: ROUTE_LAYER,
+          type: 'line',
+          source: ROUTE_SOURCE,
+          layout: { 'line-join': 'round', 'line-cap': 'round' },
+          paint: { 'line-color': routeColor, 'line-width': 5, 'line-opacity': 0.85 },
+        })
+      }
+    })
+  }, [mapStyle, routeColor])
+
   useEffect(() => {
     const map = mapRef.current
     if (!map || !currentPoint || myLocationPin) {
@@ -126,13 +194,10 @@ export default function MapView({
     } else {
       currentMarkerRef.current.setLngLat(lngLat)
       const el = headingMarkerElRef.current
-      if (el) {
-        el.className = showNav ? 'marker-nav-puck' : 'marker-heading'
-      }
+      if (el) el.className = showNav ? 'marker-nav-puck' : 'marker-heading'
     }
   }, [currentPoint, myLocationPin, isNavigating, heading])
 
-  // Rotate triangle: compass mode rotates map so triangle points up; otherwise rotate triangle.
   useEffect(() => {
     const el = headingMarkerElRef.current
     if (!el) return
@@ -146,7 +211,6 @@ export default function MapView({
     }
   }, [heading, followHeading, isNavigating])
 
-  // Navigation POV — Google Maps style: tilted view, heading up, you near the bottom.
   useEffect(() => {
     const map = mapRef.current
     if (!map || !currentPoint) return
@@ -176,7 +240,6 @@ export default function MapView({
     }
   }, [currentPoint, isNavigating, followHeading, heading])
 
-  // Flat north-up view when navigation / compass mode ends.
   useEffect(() => {
     const map = mapRef.current
     if (!map || isNavigating || followHeading) return
@@ -190,7 +253,6 @@ export default function MapView({
     }
   }, [isNavigating, followHeading])
 
-  // Pinned "you are here" marker — red arrow shown when user clicks Pin current location.
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
@@ -208,10 +270,7 @@ export default function MapView({
       el.innerHTML =
         '<span class="marker-my-location-label">You are here</span>' +
         '<span class="marker-my-location-arrow" aria-hidden="true"></span>'
-      myLocationMarkerRef.current = new maplibregl.Marker({
-        element: el,
-        anchor: 'bottom',
-      })
+      myLocationMarkerRef.current = new maplibregl.Marker({ element: el, anchor: 'bottom' })
         .setLngLat(lngLat)
         .addTo(map)
     } else {
@@ -219,7 +278,6 @@ export default function MapView({
     }
   }, [myLocationPin])
 
-  // Destination pin — hidden during navigation (triangle shows your position instead).
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
@@ -240,7 +298,6 @@ export default function MapView({
     }
   }, [destination, isNavigating])
 
-  // Recenter the map when asked to (e.g. after a manual destination search).
   useEffect(() => {
     const map = mapRef.current
     if (!map || !flyTo) return
@@ -252,7 +309,6 @@ export default function MapView({
     })
   }, [flyTo, followHeading, heading])
 
-  // Route line updates.
   useEffect(() => {
     const map = mapRef.current
     if (!map) return
@@ -261,19 +317,11 @@ export default function MapView({
       if (!src) return
       src.setData({
         type: 'Feature',
-        geometry: {
-          type: 'LineString',
-          coordinates: routeCoordinates || [],
-        },
+        geometry: { type: 'LineString', coordinates: routeCoordinates || [] },
       })
       if (map.getLayer(ROUTE_LAYER)) {
         map.setPaintProperty(ROUTE_LAYER, 'line-color', routeColor)
       }
-      // Fit the map to the route once per route. Guarding on routeKey rather
-      // than the coordinates matters now that the line is re-trimmed on every
-      // position fix — fitting each time would yank the viewport continuously
-      // and zoom ever tighter as the remaining route shrinks.
-      // Skip overview fit while navigating — the POV camera follows you instead.
       if (
         !isNavigating &&
         routeKey != null &&
@@ -293,5 +341,29 @@ export default function MapView({
     else map.once('load', apply)
   }, [routeCoordinates, routeKey, routeColor, isNavigating])
 
-  return <div ref={containerRef} className="map-container" />
+  // Traffic overlay along the active route.
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    const apply = () => {
+      const src = map.getSource(TRAFFIC_SOURCE)
+      if (!src) return
+      const features =
+        showTraffic && routeCoordinates?.length > 1
+          ? trafficOverlaySegments(routeCoordinates, { level: trafficLevel })
+          : []
+      src.setData({ type: 'FeatureCollection', features })
+    }
+    if (loadedRef.current) apply()
+    else map.once('load', apply)
+  }, [routeCoordinates, showTraffic, trafficLevel])
+
+  return (
+    <div className="map-wrap">
+      <div ref={containerRef} className="map-container" />
+      {onMapStyleChange && (
+        <MapStyleControl mapStyle={mapStyle} onChange={onMapStyleChange} />
+      )}
+    </div>
+  )
 }

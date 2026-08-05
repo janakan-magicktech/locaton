@@ -48,6 +48,7 @@ import { getUserLocation } from './userLocation.js'
 const PHOTON_BASE = 'https://photon.komoot.io/api'
 const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org/search'
 const OVERPASS_BASE = 'https://overpass-api.de/api/interpreter'
+const OPEN_METEO_GEO = 'https://geocoding-api.open-meteo.com/v1/search'
 const GEOAPIFY_AUTOCOMPLETE = 'https://api.geoapify.com/v1/geocode/autocomplete'
 const GEOAPIFY_SEARCH = 'https://api.geoapify.com/v1/geocode/search'
 const USER_AGENT = 'find-my-location/1.0 (Sri Lanka place search)'
@@ -472,6 +473,47 @@ async function fetchGeoapify(query, { origin, limit, signal, fullSearch = false 
 
 export { HAS_ENHANCED_SEARCH }
 
+// Open-Meteo — free geocoding, no API key; strong on towns and admin areas.
+async function fetchOpenMeteo(query, { limit, signal }) {
+  const params = new URLSearchParams({
+    name: query,
+    count: String(Math.min(limit, 15)),
+    language: 'en',
+    format: 'json',
+  })
+  try {
+    const res = await fetch(`${OPEN_METEO_GEO}?${params.toString()}`, { signal })
+    if (!res.ok) return []
+    const data = await res.json()
+    return (data?.results || [])
+      .map((r, i) => {
+        const inSriLanka =
+          r.country_code?.toLowerCase() === LK_COUNTRY_CODE ||
+          (r.latitude >= LK_BBOX.minLat &&
+            r.latitude <= LK_BBOX.maxLat &&
+            r.longitude >= LK_BBOX.minLon &&
+            r.longitude <= LK_BBOX.maxLon)
+        return {
+          label: r.name,
+          context: buildContext(
+            [r.admin1, r.admin2, r.admin3, r.country].filter(Boolean),
+            { inSriLanka },
+          ),
+          latitude: r.latitude,
+          longitude: r.longitude,
+          inSriLanka,
+          placeType: r.feature_code?.toLowerCase() || 'place',
+          source: 'openmeteo',
+          rank: i,
+          importance: r.population ? Math.log10(r.population + 1) : 0,
+        }
+      })
+      .filter((r) => Number.isFinite(r.latitude) && Number.isFinite(r.longitude))
+  } catch {
+    return []
+  }
+}
+
 function escapeOverpassRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
@@ -694,6 +736,9 @@ async function runPass(query, { origin, limit, signal, suggest, restrictToLK }) 
       fetchGeoapify(query, { origin, limit: fetchLimit, signal, fullSearch: !suggest }),
     )
   }
+
+  // Open-Meteo — free, no key; improves town/area search without Geoapify.
+  providers.push(fetchOpenMeteo(query, { limit: fetchLimit, signal }))
 
   if (origin && restrictToLK) {
     // Search nearby first (Pick Me style): 25 km, then 80 km, then country-wide.

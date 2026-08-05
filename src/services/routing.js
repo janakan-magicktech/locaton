@@ -62,7 +62,7 @@ export async function fetchShortestRoute(from, to) {
   const coords = `${from.longitude},${from.latitude};${to.longitude},${to.latitude}`
   const url =
     `${OSRM_BASE}/${coords}` +
-    `?overview=full&geometries=geojson&steps=false` +
+    `?overview=full&geometries=geojson&steps=true` +
     `&alternatives=3&annotations=duration,distance`
 
   const res = await fetch(url)
@@ -81,10 +81,21 @@ export async function fetchShortestRoute(from, to) {
   const ranked = [...data.routes].sort((a, b) => a.duration - b.duration)
   const [fastest, ...rest] = ranked
 
+  const parseSteps = (route) =>
+    (route.legs?.[0]?.steps || []).map((s) => ({
+      distance: s.distance,
+      duration: s.duration,
+      name: s.name || '',
+      maneuver: s.maneuver,
+      rotary_name: s.rotary_name,
+      exit: s.exit,
+    }))
+
   const toRoute = (r) => ({
     coordinates: r.geometry.coordinates, // [lng, lat] pairs
     distance: r.distance, // meters
     duration: r.duration, // seconds
+    steps: parseSteps(r),
   })
 
   return {
