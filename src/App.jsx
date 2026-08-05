@@ -495,7 +495,10 @@ export default function App() {
               </button>
               <p className="hint">…or click anywhere on the map to pin a point.</p>
 
-              <DestinationSearch onPick={handleManualDestination} />
+              <DestinationSearch
+                onPick={handleManualDestination}
+                origin={position}
+              />
 
               <label className="threshold-control">
                 Arrival threshold
