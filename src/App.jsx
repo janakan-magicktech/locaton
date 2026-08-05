@@ -10,6 +10,7 @@ import TrackingPanel from './components/TrackingPanel.jsx'
 import { useOnlineStatus } from './hooks/useOnlineStatus.js'
 import { useDatabase } from './hooks/useDatabase.js'
 import { useGeolocation } from './hooks/useGeolocation.js'
+import { requestCompassPermission, useUserHeading } from './hooks/useUserHeading.js'
 import {
   clearRecordedRoute,
   deleteSavedLocation,
@@ -87,6 +88,21 @@ export default function App() {
   const [selectedForRoute, setSelectedForRoute] = useState(null) // saved location awaiting mode choice
   const [routeError, setRouteError] = useState(null)
   const [loadingRoute, setLoadingRoute] = useState(false)
+  const [compassMode, setCompassMode] = useState(false)
+  const [tracking, setTracking] = useState(null)
+  const isNavigating = Boolean(tracking)
+
+  const userHeading = useUserHeading(position, {
+    enabled: compassMode || isNavigating,
+    navigating: isNavigating,
+  })
+  const displayHeading = userHeading ?? tracking?.bearing ?? null
+  const followHeading = (compassMode || isNavigating) && displayHeading != null
+
+  const toggleCompassMode = async () => {
+    if (!compassMode) await requestCompassPermission()
+    setCompassMode((on) => !on)
+  }
 
   // Reached threshold (meters). A ref mirrors it so the long-lived
   // watchPosition callback always reads the current value without re-binding.
@@ -97,7 +113,6 @@ export default function App() {
   }, [threshold])
 
   // Active tracking session.
-  const [tracking, setTracking] = useState(null)
   // tracking shape:
   // { location, mode, routeCoordinates, remaining, bearing, reached }
   const prevPointRef = useRef(null) // for bearing calc between updates
@@ -206,30 +221,32 @@ export default function App() {
         location.longitude,
       )
 
-      // Bearing from the last anchor to the current point (travel direction).
-      // The anchor only advances once the user has actually moved
-      // MIN_BEARING_MOVE_M; until then we keep showing the previous heading
-      // rather than recomputing one from pure GPS jitter.
+      // Prefer live GPS course; fall back to movement-derived bearing.
       let bearing = null
-      const prev = prevPointRef.current
-      if (prev) {
-        const moved = haversineMeters(
-          prev.latitude,
-          prev.longitude,
-          point.latitude,
-          point.longitude,
-        )
-        if (moved >= bearingMoveLimit(point.accuracy)) {
-          bearing = bearingDegrees(
+      if (point.heading != null && !Number.isNaN(point.heading) && point.heading >= 0) {
+        bearing = point.heading
+        prevPointRef.current = point
+      } else {
+        const prev = prevPointRef.current
+        if (prev) {
+          const moved = haversineMeters(
             prev.latitude,
             prev.longitude,
             point.latitude,
             point.longitude,
           )
+          if (moved >= bearingMoveLimit(point.accuracy)) {
+            bearing = bearingDegrees(
+              prev.latitude,
+              prev.longitude,
+              point.latitude,
+              point.longitude,
+            )
+            prevPointRef.current = point
+          }
+        } else {
           prevPointRef.current = point
         }
-      } else {
-        prevPointRef.current = point
       }
 
       // Log the breadcrumb for future "Follow Previous Path" — only while on a
@@ -306,6 +323,7 @@ export default function App() {
       trailClearedRef.current = false
       routeProgressRef.current = { index: 0, meters: -1 }
       routeKeyRef.current += 1
+      requestCompassPermission()
       const session = {
         location,
         savedLocationId: location.id,
@@ -449,6 +467,9 @@ export default function App() {
         routeKey={tracking?.routeKey}
         routeColor={tracking?.mode === 'previous' ? '#a371f7' : '#2f81f7'}
         flyTo={flyTo}
+        followHeading={followHeading}
+        heading={displayHeading}
+        isNavigating={isNavigating}
         onMapClick={handleMapClick}
       />
 
@@ -499,6 +520,14 @@ export default function App() {
             <div className="action-bar">
               <button className="primary" onClick={pinCurrentLocation}>
                 📍 Pin current location
+              </button>
+              <button
+                type="button"
+                className={compassMode ? 'primary' : ''}
+                onClick={toggleCompassMode}
+                title="Rotate map with your direction (Google Maps style)"
+              >
+                🧭 {compassMode ? 'Compass on' : 'Compass mode'}
               </button>
               <p className="hint">…or click anywhere on the map to pin a point.</p>
 
